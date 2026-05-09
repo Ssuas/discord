@@ -5,6 +5,7 @@
   "dependencies": {
     "discord.js": "^14.0.0",
     "node-fetch": "^2.6.9",
-    "form-data": "^4.0.0"
+    "form-data": "^4.0.0",
+    "music-metadata": "^7.13.4"
   }
 }
