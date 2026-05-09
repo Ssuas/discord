@@ -1,10 +1,17 @@
-const { Client, GatewayIntentBits } = require("discord.js")
+const { Client, GatewayIntentBits, REST, Routes, SlashCommandBuilder } = require("discord.js")
 const fetch = require("node-fetch")
 const FormData = require("form-data")
 
 const client = new Client({
   intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent]
 })
+
+const commands = [
+  new SlashCommandBuilder()
+    .setName("upload")
+    .setDescription("Upload an MP3 to Roblox")
+    .addAttachmentOption(o => o.setName("file").setDescription("MP3 file").setRequired(true))
+].map(c => c.toJSON())
 
 async function pollOperation(opPath) {
   for (let i = 0; i < 20; i++) {
@@ -18,25 +25,33 @@ async function pollOperation(opPath) {
   return null
 }
 
-client.on("messageCreate", async msg => {
-  if (msg.author.bot) return
-  const mp3 = msg.attachments.find(a => a.name?.endsWith(".mp3"))
-  if (!mp3) return
+client.once("ready", async () => {
+  const rest = new REST({ version: "10" }).setToken(process.env.DISCORD_TOKEN)
+  await rest.put(Routes.applicationCommands(client.user.id), { body: commands })
+  console.log("ready")
+})
 
-  const status = await msg.reply("uploading to roblox...")
+client.on("interactionCreate", async interaction => {
+  if (!interaction.isChatInputCommand()) return
+  if (interaction.commandName !== "upload") return
+
+  const file = interaction.options.getAttachment("file")
+  if (!file.name.endsWith(".mp3")) return interaction.reply({ content: "mp3 only", ephemeral: true })
+
+  await interaction.reply("uploading to roblox...")
 
   try {
-    const fileRes = await fetch(mp3.url)
+    const fileRes = await fetch(file.url)
     const buf = await fileRes.buffer()
 
     const form = new FormData()
     form.append("request", JSON.stringify({
       assetType: "Audio",
-      displayName: mp3.name.replace(".mp3", ""),
+      displayName: file.name.replace(".mp3", ""),
       description: "",
       creationContext: { creator: { userId: process.env.ROBLOX_USER_ID } }
     }), { contentType: "application/json" })
-    form.append("fileContent", buf, { filename: mp3.name, contentType: "audio/mpeg" })
+    form.append("fileContent", buf, { filename: file.name, contentType: "audio/mpeg" })
 
     const res = await fetch("https://apis.roblox.com/assets/v1/assets", {
       method: "POST",
@@ -44,20 +59,19 @@ client.on("messageCreate", async msg => {
       body: form
     })
     const data = await res.json()
-
     const opPath = data.path
-    if (!opPath) return status.edit(`failed: ${JSON.stringify(data)}`)
+    if (!opPath) return interaction.editReply(`failed: ${JSON.stringify(data)}`)
 
-    await status.edit("processing...")
+    await interaction.editReply("processing...")
     const assetId = await pollOperation(opPath)
 
     if (assetId) {
-      status.edit(`done! asset id: \`${assetId}\``)
+      interaction.editReply(`**${file.name.replace(".mp3", "")}**\nasset id: \`${assetId}\``)
     } else {
-      status.edit("upload timed out, check creator hub")
+      interaction.editReply("timed out, check creator hub")
     }
   } catch (e) {
-    status.edit(`error: ${e.message}`)
+    interaction.editReply(`error: ${e.message}`)
   }
 })
 
