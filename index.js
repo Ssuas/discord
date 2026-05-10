@@ -16,13 +16,14 @@ const client = new Client({
 })
 
 async function loadData() {
+  const defaults = { whitelist: [], universeId: null, staffRole: "Staff Team", prefixes: {} }
   try {
     const res = await fetch(`https://api.jsonbin.io/v3/b/${process.env.JSONBIN_ID}/latest`, {
       headers: { "X-Master-Key": process.env.JSONBIN_KEY }
     })
     const data = await res.json()
-    return data.record
-  } catch { return { whitelist: [], universeId: null, staffRole: "Staff Team", prefixes: {} } }
+    return { ...defaults, ...data.record }
+  } catch { return defaults }
 }
 
 async function saveData(d) {
