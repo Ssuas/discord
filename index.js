@@ -1,4 +1,4 @@
-const { Client, GatewayIntentBits, REST, Routes, SlashCommandBuilder, EmbedBuilder, ButtonBuilder, ButtonStyle, ActionRowBuilder } = require("discord.js")
+const { Client, GatewayIntentBits, REST, Routes, SlashCommandBuilder, EmbedBuilder, ButtonBuilder, ButtonStyle, ActionRowBuilder, StringSelectMenuBuilder, StringSelectMenuOptionBuilder, ModalBuilder, TextInputBuilder, TextInputStyle } = require("discord.js")
 const fetch = require("node-fetch")
 const FormData = require("form-data")
 const mm = require("music-metadata")
@@ -139,6 +139,55 @@ function emb(color, desc, title) {
   return { embeds: [e] }
 }
 
+async function getRobloxUserById(userId) {
+  const res = await fetch(`https://users.roblox.com/v1/users/${userId}`)
+  const data = await res.json()
+  return data?.id ? data : null
+}
+
+async function resolveRobloxId(input) {
+  if (/^\d+$/.test(input)) {
+    const u = await getRobloxUserById(input)
+    return u ? { id: String(u.id), name: u.name, displayName: u.displayName } : { id: input, name: input, displayName: input }
+  }
+  const u = await getRobloxUser(input)
+  return u ? { id: String(u.id), name: u.name, displayName: u.displayName } : null
+}
+
+async function getPlayerData(uid, userId, dsName) {
+  const { status, body } = await dsGetEntry(uid, dsName, `Player_${userId}`)
+  if (status !== 200) return null
+  try { return JSON.parse(body) } catch { return null }
+}
+
+async function setPlayerData(uid, userId, pdata, dsName) {
+  return dsSetEntry(uid, dsName, `Player_${userId}`, JSON.stringify(pdata))
+}
+
+function makeSaveSelect(saves, field, token) {
+  const opts = Object.keys(saves)
+    .sort((a, b) => parseInt(a.slice(4)) - parseInt(b.slice(4)))
+    .slice(0, 25)
+    .map(slot => new StringSelectMenuOptionBuilder()
+      .setLabel(slot)
+      .setValue(slot)
+      .setDescription(String(saves[slot]).slice(0, 100))
+    )
+  return new ActionRowBuilder().addComponents(
+    new StringSelectMenuBuilder()
+      .setCustomId(`${field}_select_${token}`)
+      .setPlaceholder("Select a slot to edit...")
+      .addOptions(opts)
+  )
+}
+
+function fmtSaves(saves) {
+  return Object.entries(saves)
+    .sort(([a], [b]) => parseInt(a.slice(4)) - parseInt(b.slice(4)))
+    .map(([k, v]) => `\`${k}\`: ${v}`)
+    .join("\n")
+}
+
 function confirmRow(token) {
   return new ActionRowBuilder().addComponents(
     new ButtonBuilder().setCustomId(`confirm_${token}`).setLabel("Confirm").setStyle(ButtonStyle.Danger),
@@ -198,6 +247,172 @@ client.on("messageCreate", async msg => {
   const args = msg.content.slice(prefix.length).trim().split(/\s+/)
   const cmd = args.shift().toLowerCase()
   const reply = t => msg.reply(typeof t === "string" ? emb(C.info, t) : t)
+
+  if (cmd === "setmainds") {
+    if (msg.author.id !== process.env.OWNER_ID) return reply(emb(C.err, "owner only."))
+    if (!args[0]) return reply(emb(C.warn, `usage: \`${prefix}setmainds <datastore name>\``))
+    const d = await loadData()
+    d.mainDatastore = args[0]
+    await saveData(d)
+    return reply(emb(C.ok, `main datastore set to \`${args[0]}\``))
+  }
+
+  if (cmd === "getstats") {
+    if (msg.author.id !== process.env.OWNER_ID) return reply(emb(C.err, "owner only."))
+    if (!args[0]) return reply(emb(C.warn, `usage: \`${prefix}getstats <username/userid>\``))
+    const status = await reply(emb(C.info, "fetching..."))
+    const d = await loadData()
+    const uid = d.universeId
+    if (!uid) return status.edit(emb(C.err, "universe ID not set."))
+    const dsName = d.mainDatastore || "MainData_v2"
+    const user = await resolveRobloxId(args[0])
+    if (!user) return status.edit(emb(C.err, "user not found."))
+    const pdata = await getPlayerData(uid, user.id, dsName)
+    if (!pdata) return status.edit(emb(C.err, `no data for **${user.name}**.`))
+    const data = pdata.Data
+    const quest = data.quest || {}
+    const trunc = s => s.length > 1020 ? s.slice(0, 1020) + "..." : (s || "none")
+    return status.edit({ embeds: [new EmbedBuilder()
+      .setColor(C.info)
+      .setTitle(`Stats — ${user.displayName} (${user.name})`)
+      .addFields(
+        { name: "💰 Coins", value: `\`${(data.coins || 0).toLocaleString()}\``, inline: true },
+        { name: "🎭 Stand", value: `\`${data.troll_stand || "none"}\``, inline: true },
+        { name: "🔢 Type", value: `\`${data.type_i ?? "?"}\``, inline: true },
+        { name: "📋 Quest", value: `**${quest.Name || "none"}**\nGoal: \`${quest.Goal}\` | Progress: \`${quest.Progress}\` | Reward: \`${quest.Reward || "?"}\`` },
+        { name: `🎭 Troll Saves (${Object.keys(data.troll_saves || {}).length})`, value: trunc(fmtSaves(data.troll_saves || {})) },
+        { name: `🎒 Item Saves (${Object.keys(data.item_saves || {}).length})`, value: trunc(fmtSaves(data.item_saves || {})) }
+      )
+      .setFooter({ text: `Player_${user.id} | ${dsName}` })
+    ] })
+  }
+
+  if (cmd === "settroll" || cmd === "setitem") {
+    if (msg.author.id !== process.env.OWNER_ID) return reply(emb(C.err, "owner only."))
+    if (!args[0]) return reply(emb(C.warn, `usage: \`${prefix}${cmd} <username/userid>\``))
+    const field = cmd === "settroll" ? "troll_saves" : "item_saves"
+    const label = cmd === "settroll" ? "Troll Saves" : "Item Saves"
+    const status = await reply(emb(C.info, "fetching..."))
+    const d = await loadData()
+    const uid = d.universeId
+    if (!uid) return status.edit(emb(C.err, "universe ID not set."))
+    const dsName = d.mainDatastore || "MainData_v2"
+    const user = await resolveRobloxId(args[0])
+    if (!user) return status.edit(emb(C.err, "user not found."))
+    const pdata = await getPlayerData(uid, user.id, dsName)
+    if (!pdata) return status.edit(emb(C.err, `no data for **${user.name}**.`))
+    const saves = pdata.Data[field] || {}
+    const token = mkToken()
+    setPending(token, { type: `${field}_select`, uid, dsName, userId: user.id, username: user.name, displayName: user.displayName, pdata, field })
+    const preview = fmtSaves(saves)
+    return status.edit({
+      embeds: [new EmbedBuilder()
+        .setColor(C.info)
+        .setTitle(`${label} — ${user.displayName} (${user.name})`)
+        .setDescription(preview.length > 2000 ? preview.slice(0, 2000) + "..." : preview || "empty")
+        .setFooter({ text: "Select a slot below to edit" })
+      ],
+      components: [makeSaveSelect(saves, field, token)]
+    })
+  }
+
+  if (cmd === "setcoins") {
+    if (msg.author.id !== process.env.OWNER_ID) return reply(emb(C.err, "owner only."))
+    if (!args[0] || !args[1]) return reply(emb(C.warn, `usage: \`${prefix}setcoins <username/userid> <amount>\``))
+    const amount = parseInt(args[1])
+    if (isNaN(amount) || amount < 0) return reply(emb(C.err, "invalid amount."))
+    const status = await reply(emb(C.info, "fetching..."))
+    const d = await loadData()
+    const uid = d.universeId
+    if (!uid) return status.edit(emb(C.err, "universe ID not set."))
+    const dsName = d.mainDatastore || "MainData_v2"
+    const user = await resolveRobloxId(args[0])
+    if (!user) return status.edit(emb(C.err, "user not found."))
+    const pdata = await getPlayerData(uid, user.id, dsName)
+    if (!pdata) return status.edit(emb(C.err, `no data for **${user.name}**.`))
+    const oldCoins = pdata.Data.coins || 0
+    const newPdata = JSON.parse(JSON.stringify(pdata))
+    newPdata.Data.coins = amount
+    const token = mkToken()
+    setPending(token, { type: "generic_confirm", uid, dsName, userId: user.id, newPdata })
+    return status.edit({
+      ...emb(C.warn, [`**Player:** ${user.displayName} (\`${user.name}\`)`, `**Coins:** \`${oldCoins.toLocaleString()}\` → \`${amount.toLocaleString()}\``].join("\n"), "Confirm Set Coins"),
+      components: [confirmRow(token)]
+    })
+  }
+
+  if (cmd === "setstand") {
+    if (msg.author.id !== process.env.OWNER_ID) return reply(emb(C.err, "owner only."))
+    const stand = args.slice(1).join(" ")
+    if (!args[0] || !stand) return reply(emb(C.warn, `usage: \`${prefix}setstand <username/userid> <stand name>\``))
+    const status = await reply(emb(C.info, "fetching..."))
+    const d = await loadData()
+    const uid = d.universeId
+    if (!uid) return status.edit(emb(C.err, "universe ID not set."))
+    const dsName = d.mainDatastore || "MainData_v2"
+    const user = await resolveRobloxId(args[0])
+    if (!user) return status.edit(emb(C.err, "user not found."))
+    const pdata = await getPlayerData(uid, user.id, dsName)
+    if (!pdata) return status.edit(emb(C.err, `no data for **${user.name}**.`))
+    const oldStand = pdata.Data.troll_stand
+    const newPdata = JSON.parse(JSON.stringify(pdata))
+    newPdata.Data.troll_stand = stand
+    const token = mkToken()
+    setPending(token, { type: "generic_confirm", uid, dsName, userId: user.id, newPdata })
+    return status.edit({
+      ...emb(C.warn, [`**Player:** ${user.displayName} (\`${user.name}\`)`, `**Stand:** \`${oldStand}\` → \`${stand}\``].join("\n"), "Confirm Set Stand"),
+      components: [confirmRow(token)]
+    })
+  }
+
+  if (cmd === "setquest") {
+    if (msg.author.id !== process.env.OWNER_ID) return reply(emb(C.err, "owner only."))
+    if (args.length < 5) return reply(emb(C.warn, `usage: \`${prefix}setquest <user> <name> <goal> <progress> <reward>\` (use _ for spaces in name/reward)`))
+    const [input, rawName, goalStr, progressStr, ...rewardParts] = args
+    const questName = rawName.replace(/_/g, " ")
+    const goal = parseInt(goalStr)
+    const progress = parseInt(progressStr)
+    const reward = rewardParts.join(" ").replace(/_/g, " ")
+    if (isNaN(goal) || isNaN(progress)) return reply(emb(C.err, "goal and progress must be numbers."))
+    const status = await reply(emb(C.info, "fetching..."))
+    const d = await loadData()
+    const uid = d.universeId
+    if (!uid) return status.edit(emb(C.err, "universe ID not set."))
+    const dsName = d.mainDatastore || "MainData_v2"
+    const user = await resolveRobloxId(input)
+    if (!user) return status.edit(emb(C.err, "user not found."))
+    const pdata = await getPlayerData(uid, user.id, dsName)
+    if (!pdata) return status.edit(emb(C.err, `no data for **${user.name}**.`))
+    const newPdata = JSON.parse(JSON.stringify(pdata))
+    newPdata.Data.quest = { Name: questName, Goal: goal, Progress: progress, Reward: reward }
+    const token = mkToken()
+    setPending(token, { type: "generic_confirm", uid, dsName, userId: user.id, newPdata })
+    return status.edit({
+      ...emb(C.warn, [
+        `**Player:** ${user.displayName} (\`${user.name}\`)`,
+        `**Name:** ${questName}`,
+        `**Goal:** ${goal} | **Progress:** ${progress}`,
+        `**Reward:** ${reward}`
+      ].join("\n"), "Confirm Set Quest"),
+      components: [confirmRow(token)]
+    })
+  }
+
+  if (cmd === "viewraw") {
+    if (msg.author.id !== process.env.OWNER_ID) return reply(emb(C.err, "owner only."))
+    if (!args[0]) return reply(emb(C.warn, `usage: \`${prefix}viewraw <username/userid>\``))
+    const status = await reply(emb(C.info, "fetching..."))
+    const d = await loadData()
+    const uid = d.universeId
+    if (!uid) return status.edit(emb(C.err, "universe ID not set."))
+    const dsName = d.mainDatastore || "MainData_v2"
+    const user = await resolveRobloxId(args[0])
+    if (!user) return status.edit(emb(C.err, "user not found."))
+    const { status: httpStatus, body } = await dsGetEntry(uid, dsName, `Player_${user.id}`)
+    if (httpStatus !== 200) return status.edit(emb(C.err, `no data found (${httpStatus}).`))
+    const preview = body.length > 1800 ? body.slice(0, 1800) + "\n...(truncated)" : body
+    return status.edit(emb(C.info, `\`\`\`json\n${preview}\n\`\`\``, `Raw — Player_${user.id}`))
+        }
 
   if (cmd === "setprefix") {
     if (!await hasStaff(msg.member)) return reply(emb(C.err, "staff only."))
@@ -373,200 +588,95 @@ client.on("messageCreate", async msg => {
 })
 
 client.on("interactionCreate", async interaction => {
+  if (interaction.isStringSelectMenu()) {
+    const cidx = interaction.customId.indexOf("_select_")
+    if (cidx === -1) return
+    const field = interaction.customId.slice(0, cidx)
+    const token = interaction.customId.slice(cidx + 8)
+    const pend = pending.get(token)
+    if (!pend) return interaction.reply({ ...emb(C.err, "this action has expired."), ephemeral: true })
+    const slot = interaction.values[0]
+    const currentVal = String(pend.pdata.Data[field][slot] ?? "")
+    pend.slot = slot
+    pending.set(token, pend)
+    const modal = new ModalBuilder()
+      .setCustomId(`save_modal_${token}`)
+      .setTitle(`Edit ${slot}`)
+    modal.addComponents(new ActionRowBuilder().addComponents(
+      new TextInputBuilder()
+        .setCustomId("new_value")
+        .setLabel(`New value for ${slot}`)
+        .setStyle(TextInputStyle.Short)
+        .setValue(currentVal.slice(0, 4000))
+        .setRequired(true)
+        .setMaxLength(200)
+    ))
+    return interaction.showModal(modal)
+  }
+
+  if (interaction.isModalSubmit()) {
+    if (!interaction.customId.startsWith("save_modal_")) return
+    const token = interaction.customId.slice(11)
+    const pend = pending.get(token)
+    if (!pend) return interaction.reply({ ...emb(C.err, "this action has expired."), ephemeral: true })
+    pending.delete(token)
+    const newVal = interaction.fields.getTextInputValue("new_value")
+    const { slot, field, uid, dsName, userId, username, displayName, pdata } = pend
+    const newPdata = JSON.parse(JSON.stringify(pdata))
+    newPdata.Data[field][slot] = newVal
+    const confirmToken = mkToken()
+    const label = field === "troll_saves" ? "Troll Save" : "Item Save"
+    setPending(confirmToken, { type: "generic_confirm", uid, dsName, userId, newPdata })
+    return interaction.reply({
+      ...emb(C.warn, [
+        `**Player:** ${displayName} (\`${username}\`)`,
+        `**Slot:** \`${slot}\``,
+        `**New Value:** ${newVal}`
+      ].join("\n"), `Confirm Edit ${label}`),
+      components: [confirmRow(confirmToken)]
+    })
+  }
+
   if (interaction.isButton()) {
-    const [btnAction, btnToken] = interaction.customId.split("_")
+    const parts = interaction.customId.split("_")
+    const btnAction = parts[0]
+    const btnToken = parts[parts.length - 1]
     const data = pending.get(btnToken)
     if (!data) return interaction.reply({ ...emb(C.err, "this action has expired."), ephemeral: true })
     pending.delete(btnToken)
     if (btnAction === "cancel") return interaction.update({ ...emb(C.info, "action cancelled."), components: [] })
 
-    if (data.type === "ban") {
-      const res = await fetch(`https://apis.roblox.com/cloud/v2/universes/${data.gameId}/user-restrictions/${data.userId}?updateMask=gameJoinRestriction`, {
-        method: "PATCH",
-        headers: { "x-api-key": process.env.ROBLOX_BAN_API_KEY, "Content-Type": "application/json" },
-        body: JSON.stringify({ gameJoinRestriction: { active: true, privateReason: data.reason, displayReason: "You have been banned from this experience." } })
-      })
-      if (!res.ok) return interaction.update({ ...emb(C.err, `ban failed. status: \`${res.status}\``), components: [] })
-      return interaction.update({
-        ...emb(C.ok, [`**Roblox User:** ${data.displayName} (\`${data.username}\`)`, `**User ID:** \`${data.userId}\``, `**Reason:** ${data.reason}`, `**Banned By:** ${data.by}`].join("\n"), "🔨 Player Banned"),
-        components: []
-      })
-    }
-
-    if (data.type === "unban") {
-      const res = await fetch(`https://apis.roblox.com/cloud/v2/universes/${data.gameId}/user-restrictions/${data.userId}?updateMask=gameJoinRestriction`, {
-        method: "PATCH",
-        headers: { "x-api-key": process.env.ROBLOX_BAN_API_KEY, "Content-Type": "application/json" },
-        body: JSON.stringify({ gameJoinRestriction: { active: false, privateReason: "", displayReason: "", excludeAltAccounts: false } })
-      })
-      if (!res.ok) return interaction.update({ ...emb(C.err, `unban failed. status: \`${res.status}\``), components: [] })
-      return interaction.update({
-        ...emb(C.ok, [`**Roblox User:** ${data.displayName} (\`${data.username}\`)`, `**User ID:** \`${data.userId}\``, `**Unbanned By:** ${data.by}`].join("\n"), "✅ Player Unbanned"),
-        components: []
-      })
+    if (data.type === "generic_confirm") {
+      const { ok, status } = await setPlayerData(data.uid, data.userId, data.newPdata, data.dsName)
+      return interaction.update({ ...emb(ok ? C.ok : C.err, ok ? "data updated successfully." : `failed (${status})`), components: [] })
     }
 
     if (data.type === "dsdel") {
       const { status, ok } = await dsDeleteEntry(data.uid, data.store, data.key)
       return interaction.update({ ...emb(ok ? C.ok : C.err, ok ? `**${data.store} / ${data.key}** deleted.` : `failed (${status})`), components: [] })
     }
-    return
-  }
 
-  if (!interaction.isChatInputCommand()) return
-  const cmd = interaction.commandName
-  const sub = interaction.options.getSubcommand(false)
-
-  if (cmd === "upload") {
-    if (!await isWhitelisted(interaction.user.id) && !await hasStaff(interaction.member)) {
-      return interaction.reply({ ...emb(C.err, "you're not whitelisted."), ephemeral: true })
-    }
-    const files = []
-    for (let i = 1; i <= FILE_COUNT; i++) {
-      const f = interaction.options.getAttachment(`file${i}`)
-      if (f) files.push(f)
-    }
-    if (files.some(f => !f.name.endsWith(".mp3"))) return interaction.reply({ ...emb(C.err, "mp3 files only."), ephemeral: true })
-    await interaction.reply(emb(C.info, `uploading ${files.length} file(s)...`))
-    const lines = []
-    for (const file of files) {
-      try {
-        const { name, assetId, duration } = await uploadFile(file)
-        lines.push(`**${name}** — \`${assetId}\` — ${duration}`)
-      } catch (e) {
-        lines.push(`**${file.name}** — failed: ${e.message}`)
-      }
-    }
-    return interaction.editReply(emb(C.ok, lines.join("\n"), "Upload Results"))
-  }
-
-  if (cmd === "whitelist") {
-    if (interaction.user.id !== process.env.OWNER_ID) return interaction.reply({ ...emb(C.err, "owner only."), ephemeral: true })
-    const d = await loadData()
-    if (sub === "add") {
-      const user = interaction.options.getUser("user")
-      if (d.whitelist.includes(user.id)) return interaction.reply({ ...emb(C.warn, `${user.username} is already whitelisted.`), ephemeral: true })
-      d.whitelist.push(user.id)
-      await saveData(d)
-      return interaction.reply(emb(C.ok, `**${user.username}** added to whitelist.`))
-    }
-    if (sub === "remove") {
-      const user = interaction.options.getUser("user")
-      if (!d.whitelist.includes(user.id)) return interaction.reply({ ...emb(C.warn, `${user.username} isn't whitelisted.`), ephemeral: true })
-      d.whitelist = d.whitelist.filter(id => id !== user.id)
-      await saveData(d)
-      return interaction.reply(emb(C.ok, `**${user.username}** removed from whitelist.`))
-    }
-    if (sub === "list") {
-      if (!d.whitelist.length) return interaction.reply(emb(C.info, "no users whitelisted."))
-      return interaction.reply(emb(C.info, d.whitelist.map(id => `<@${id}>`).join("\n"), "Whitelisted Users"))
-    }
-  }
-
-  if (cmd === "setup") {
-    if (!await hasStaff(interaction.member)) return interaction.reply({ ...emb(C.err, "staff only."), ephemeral: true })
-    const d = await loadData()
-    if (sub === "universe") {
-      d.universeId = interaction.options.getString("id")
-      await saveData(d)
-      return interaction.reply(emb(C.ok, `universe ID set to \`${d.universeId}\``))
-    }
-    if (sub === "staffrole") {
-      d.staffRole = interaction.options.getString("name")
-      await saveData(d)
-      return interaction.reply(emb(C.ok, `staff role set to **${d.staffRole}**`))
-    }
-    if (sub === "prefix") {
-      const np = interaction.options.getString("prefix")
-      if (!d.prefixes) d.prefixes = {}
-      d.prefixes[interaction.guild.id] = np
-      await saveData(d)
-      return interaction.reply(emb(C.ok, `prefix set to \`${np}\``))
-    }
-    if (sub === "show") {
-      const prefix = await getPrefix(interaction.guild.id)
-      return interaction.reply(emb(C.info, [
-        `**Universe ID:** \`${d.universeId || "not set"}\``,
-        `**Staff Role:** ${d.staffRole || "Staff Team"}`,
-        `**Prefix:** \`${prefix}\``,
-        `**Whitelisted Users:** ${d.whitelist.length}`
-      ].join("\n"), "Bot Settings"))
-    }
-  }
-
-  if (cmd === "ds") {
-    if (!await hasStaff(interaction.member) && !await isWhitelisted(interaction.user.id)) return interaction.reply({ ...emb(C.err, "you're not whitelisted."), ephemeral: true })
-    const d = await loadData()
-    const uid = d.universeId
-    if (!uid) return interaction.reply({ ...emb(C.err, "universe ID not set. run /setup universe first."), ephemeral: true })
-    await interaction.deferReply()
-    if (sub === "list") {
-      const data = await dsListStores(uid)
-      const stores = data?.datastores?.map(s => `\`${s.name}\``).join("\n")
-      return interaction.editReply(emb(stores ? C.info : C.warn, stores || "no datastores found.", stores ? "Datastores" : null))
-    }
-    if (sub === "entries") {
-      const store = interaction.options.getString("store")
-      const data = await dsListEntries(uid, store)
-      const keys = data?.keys?.map(k => `\`${k.key}\``).join("\n")
-      return interaction.editReply(emb(keys ? C.info : C.warn, keys || "no entries found.", keys ? `${store} Entries` : null))
-    }
-    if (sub === "get") {
-      const store = interaction.options.getString("store"), key = interaction.options.getString("key")
-      const { status, body } = await dsGetEntry(uid, store, key)
-      if (status !== 200) return interaction.editReply(emb(C.err, `failed (${status})`))
-      const preview = body.length > 1800 ? body.slice(0, 1800) + "..." : body
-      return interaction.editReply(emb(C.info, `\`\`\`json\n${preview}\n\`\`\``, `${store} / ${key}`))
-    }
-    if (sub === "set") {
-      const store = interaction.options.getString("store"), key = interaction.options.getString("key")
-      let value = interaction.options.getString("value")
-      try { JSON.parse(value) } catch { value = JSON.stringify(value) }
-      const { status, ok } = await dsSetEntry(uid, store, key, value)
-      return interaction.editReply(emb(ok ? C.ok : C.err, ok ? `**${store} / ${key}** updated.` : `failed (${status})`))
-    }
-    if (sub === "delete") {
-      const store = interaction.options.getString("store"), key = interaction.options.getString("key")
-      const token = mkToken()
-      setPending(token, { type: "dsdel", uid, store, key })
-      return interaction.editReply({ ...emb(C.warn, `delete **${store} / ${key}**?`, "Confirm Delete"), components: [confirmRow(token)] })
-    }
-    if (sub === "increment") {
-      const store = interaction.options.getString("store"), key = interaction.options.getString("key")
-      const amount = interaction.options.getNumber("amount")
-      const { status, body, ok } = await dsIncrementEntry(uid, store, key, amount)
-      return interaction.editReply(emb(ok ? C.ok : C.err, ok ? `**${store} / ${key}** new value: \`${body}\`` : `failed (${status})`))
-    }
-    if (sub === "versions") {
-      const store = interaction.options.getString("store"), key = interaction.options.getString("key")
-      const data = await dsListVersions(uid, store, key)
-      const versions = data?.versions?.map(v => `\`${v.version}\` — ${new Date(v.createdTime).toLocaleString()}`).join("\n")
-      return interaction.editReply(emb(versions ? C.info : C.warn, versions || "no versions found.", versions ? `${store} / ${key} Versions` : null))
-    }
-  }
-
-  if (cmd === "rban" || cmd === "runban") {
-    if (!await hasStaff(interaction.member)) return interaction.reply({ ...emb(C.err, "staff only."), ephemeral: true })
-    const username = interaction.options.getString("username")
-    const reason = interaction.options.getString("reason") || "No reason provided"
-    const d = await loadData()
-    const gameId = d.universeId || "5254578111"
-    await interaction.reply(emb(C.info, "looking up user..."))
-    const user = await getRobloxUser(username)
-    if (!user) return interaction.editReply(emb(C.err, `no Roblox user found for **${username}**.`))
-    const token = mkToken()
-    if (cmd === "rban") {
-      setPending(token, { type: "ban", userId: user.id, username, displayName: user.displayName, reason, gameId, by: interaction.user.username })
-      return interaction.editReply({
-        ...emb(C.warn, [`**Roblox User:** ${user.displayName} (\`${username}\`)`, `**User ID:** \`${user.id}\``, `**Reason:** ${reason}`].join("\n"), "Confirm Ban"),
-        components: [confirmRow(token)]
+    if (data.type === "ban") {
+      const res = await fetch(`https://apis.roblox.com/cloud/v2/universes/${data.gameId}/user-restrictions/${data.userId}`, {
+        method: "PATCH",
+        headers: { "x-api-key": process.env.ROBLOX_API_KEY, "Content-Type": "application/json" },
+        body: JSON.stringify({ gameJoinRestriction: { active: true, privateReason: data.reason, displayReason: data.reason } })
       })
+      const result = await res.json()
+      const ok = res.ok || result?.gameJoinRestriction
+      return interaction.update({ ...emb(ok ? C.ok : C.err, ok ? `**${data.displayName}** (\`${data.username}\`) banned.\n**Reason:** ${data.reason}` : `failed: ${JSON.stringify(result)}`), components: [] })
     }
-    setPending(token, { type: "unban", userId: user.id, username, displayName: user.displayName, gameId, by: interaction.user.username })
-    return interaction.editReply({
-      ...emb(C.warn, [`**Roblox User:** ${user.displayName} (\`${username}\`)`, `**User ID:** \`${user.id}\``].join("\n"), "Confirm Unban"),
-      components: [confirmRow(token)]
-    })
+
+    if (data.type === "unban") {
+      const res = await fetch(`https://apis.roblox.com/cloud/v2/universes/${data.gameId}/user-restrictions/${data.userId}`, {
+        method: "PATCH",
+        headers: { "x-api-key": process.env.ROBLOX_API_KEY, "Content-Type": "application/json" },
+        body: JSON.stringify({ gameJoinRestriction: { active: false } })
+      })
+      const result = await res.json()
+      const ok = res.ok || result?.gameJoinRestriction
+      return interaction.update({ ...emb(ok ? C.ok : C.err, ok ? `**${data.displayName}** (\`${data.username}\`) unbanned.` : `failed: ${JSON.stringify(result)}`), components: [] })
+    }
   }
 })
 
