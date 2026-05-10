@@ -222,7 +222,7 @@ const unbanCmd = new SlashCommandBuilder()
   .setDescription("Unban a Roblox user")
   .addStringOption(o => o.setName("username").setDescription("Roblox username").setRequired(true))
 
-client.once("ready", async () => {
+client.once("clientReady", async () => {
   const rest = new REST({ version: "10" }).setToken(process.env.DISCORD_TOKEN)
   await rest.put(Routes.applicationCommands(client.user.id), {
     body: [uploadCmd, whitelistCmd, setupCmd, dsCmd, banCmd, unbanCmd].map(c => c.toJSON())
