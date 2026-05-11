@@ -28,6 +28,21 @@ const POLL_INTERVAL = 3000;
 const POLL_MAX = 20;
 const C = { ok: 0x57f287, err: 0xed4245, info: 0x5865f2, warn: 0xfee75c };
 
+const REQUIRED_ENV = ["DISCORD_TOKEN", "OWNER_ID"];
+const JSONBIN_ENV = ["JSONBIN_ID", "JSONBIN_KEY"];
+
+for (const key of REQUIRED_ENV) {
+  if (!process.env[key]) {
+    console.error(`[FATAL] Missing required env var: ${key}`);
+    process.exit(1);
+  }
+}
+for (const key of JSONBIN_ENV) {
+  if (!process.env[key]) {
+    console.warn(`[WARN] Missing env var: ${key} — data will not persist across restarts`);
+  }
+}
+
 const pending = new Map();
 const pendingTimers = new Map();
 
@@ -52,22 +67,31 @@ async function loadData(bust = false) {
     prefixes: {},
     mainDatastore: "MainData_v2"
   };
+  if (!process.env.JSONBIN_ID || !process.env.JSONBIN_KEY) return defaults;
   try {
     const res = await fetch(
       `https://api.jsonbin.io/v3/b/${process.env.JSONBIN_ID}/latest`,
       { headers: { "X-Master-Key": process.env.JSONBIN_KEY } }
     );
-    if (!res.ok) return defaults;
+    if (!res.ok) {
+      console.error(`[loadData] JSONBin fetch failed: ${res.status}`);
+      return defaults;
+    }
     const json = await res.json();
     dataCache = { ...defaults, ...json.record };
     dataCacheTTL = Date.now() + CACHE_DURATION;
     return structuredClone(dataCache);
-  } catch {
+  } catch (e) {
+    console.error("[loadData] error:", e.message);
     return defaults;
   }
 }
 
 async function saveData(d) {
+  if (!process.env.JSONBIN_ID || !process.env.JSONBIN_KEY) {
+    console.error("[saveData] JSONBin env vars not set — cannot persist data");
+    return false;
+  }
   const res = await fetch(
     `https://api.jsonbin.io/v3/b/${process.env.JSONBIN_ID}`,
     {
@@ -361,7 +385,12 @@ function makeSaveSelect(saves, field, token) {
   const keys = Object.keys(saves);
   if (!keys.length) return null;
   const opts = keys
-    .sort((a, b) => parseInt(a.slice(4)) - parseInt(b.slice(4)))
+    .sort((a, b) => {
+      const na = parseInt(a.replace(/\D/g, ""));
+      const nb = parseInt(b.replace(/\D/g, ""));
+      if (!isNaN(na) && !isNaN(nb)) return na - nb;
+      return a.localeCompare(b);
+    })
     .slice(0, 25)
     .map((slot) =>
       new StringSelectMenuOptionBuilder()
@@ -379,7 +408,12 @@ function makeSaveSelect(saves, field, token) {
 
 function fmtSaves(saves) {
   return Object.entries(saves)
-    .sort(([a], [b]) => parseInt(a.slice(4)) - parseInt(b.slice(4)))
+    .sort(([a], [b]) => {
+      const na = parseInt(a.replace(/\D/g, ""));
+      const nb = parseInt(b.replace(/\D/g, ""));
+      if (!isNaN(na) && !isNaN(nb)) return na - nb;
+      return a.localeCompare(b);
+    })
     .map(([k, v]) => `\`${k}\`: ${v}`)
     .join("\n");
 }
@@ -584,7 +618,7 @@ const banSlash = new SlashCommandBuilder()
   .setName("rban")
   .setDescription("Ban a Roblox user")
   .addStringOption((o) =>
-    o.setName("username").setDescription("Roblox username").setRequired(true)
+    o.setName("username").setDescription("Roblox username or user ID").setRequired(true)
   )
   .addStringOption((o) =>
     o.setName("reason").setDescription("Ban reason")
@@ -594,7 +628,7 @@ const unbanSlash = new SlashCommandBuilder()
   .setName("runban")
   .setDescription("Unban a Roblox user")
   .addStringOption((o) =>
-    o.setName("username").setDescription("Roblox username").setRequired(true)
+    o.setName("username").setDescription("Roblox username or user ID").setRequired(true)
   );
 
 const slashCommands = [
@@ -630,7 +664,8 @@ const prefixHandlers = {
     const name = args[0].slice(0, 100);
     const d = await loadData(true);
     d.mainDatastore = name;
-    await saveData(d);
+    const ok = await saveData(d);
+    if (!ok) return safeReply(msg, emb(C.err, "failed to save. check JSONBIN env vars."));
     return safeReply(msg, emb(C.ok, `main datastore set to \`${name}\``));
   },
 
@@ -999,7 +1034,8 @@ const prefixHandlers = {
     const d = await loadData(true);
     if (!d.prefixes) d.prefixes = {};
     d.prefixes[msg.guild.id] = np;
-    await saveData(d);
+    const ok = await saveData(d);
+    if (!ok) return safeReply(msg, emb(C.err, "failed to save. check JSONBIN env vars."));
     return safeReply(msg, emb(C.ok, `prefix set to \`${np}\``));
   },
 
@@ -1054,7 +1090,8 @@ const prefixHandlers = {
           emb(C.warn, `${mentioned.username} is already whitelisted.`)
         );
       d.whitelist.push(mentioned.id);
-      await saveData(d);
+      const ok = await saveData(d);
+      if (!ok) return safeReply(msg, emb(C.err, "failed to save. check JSONBIN env vars."));
       return safeReply(
         msg,
         emb(C.ok, `**${mentioned.username}** added to whitelist.`)
@@ -1073,7 +1110,8 @@ const prefixHandlers = {
           emb(C.warn, `${mentioned.username} isn't whitelisted.`)
         );
       d.whitelist = d.whitelist.filter((id) => id !== mentioned.id);
-      await saveData(d);
+      const ok = await saveData(d);
+      if (!ok) return safeReply(msg, emb(C.err, "failed to save. check JSONBIN env vars."));
       return safeReply(
         msg,
         emb(C.ok, `**${mentioned.username}** removed from whitelist.`)
@@ -1111,7 +1149,8 @@ const prefixHandlers = {
       if (!/^\d+$/.test(args[1]))
         return safeReply(msg, emb(C.err, "universe ID must be numeric."));
       d.universeId = args[1];
-      await saveData(d);
+      const ok = await saveData(d);
+      if (!ok) return safeReply(msg, emb(C.err, "failed to save. check JSONBIN env vars."));
       return safeReply(
         msg,
         emb(C.ok, `universe ID set to \`${d.universeId}\``)
@@ -1127,7 +1166,8 @@ const prefixHandlers = {
       if (roleName.length > 100)
         return safeReply(msg, emb(C.err, "role name too long (max 100)."));
       d.staffRole = roleName;
-      await saveData(d);
+      const ok = await saveData(d);
+      if (!ok) return safeReply(msg, emb(C.err, "failed to save. check JSONBIN env vars."));
       return safeReply(
         msg,
         emb(C.ok, `staff role set to **${d.staffRole}**`)
@@ -1158,11 +1198,11 @@ const prefixHandlers = {
   async rban(msg, args, prefix) {
     if (!await hasStaff(msg.member))
       return safeReply(msg, emb(C.err, "staff only."));
-    const username = args[0];
-    if (!username)
+    const input = args[0];
+    if (!input)
       return safeReply(
         msg,
-        emb(C.warn, `usage: \`${prefix}rban <username> [reason]\``)
+        emb(C.warn, `usage: \`${prefix}rban <username or userid> [reason]\``)
       );
     const reason = args.slice(1).join(" ").slice(0, 500) || "No reason provided";
     const d = await loadData();
@@ -1171,17 +1211,17 @@ const prefixHandlers = {
       return safeReply(msg, emb(C.err, "universe ID not set."));
     const status = await safeReply(msg, emb(C.info, "looking up user..."));
     if (!status) return;
-    const user = await getRobloxUser(username);
+    const user = await resolveRobloxId(input);
     if (!user)
       return safeEdit(
         status,
-        emb(C.err, `no Roblox user found for **${username}**.`)
+        emb(C.err, `no Roblox user found for **${input}**.`)
       );
     const token = mkToken();
     setPending(token, {
       type: "ban",
       userId: user.id,
-      username,
+      username: user.name,
       displayName: user.displayName,
       reason,
       gameId,
@@ -1192,7 +1232,7 @@ const prefixHandlers = {
       ...emb(
         C.warn,
         [
-          `**Roblox User:** ${user.displayName} (\`${username}\`)`,
+          `**Roblox User:** ${user.displayName} (\`${user.name}\`)`,
           `**User ID:** \`${user.id}\``,
           `**Reason:** ${reason}`
         ].join("\n"),
@@ -1205,11 +1245,11 @@ const prefixHandlers = {
   async runban(msg, args, prefix) {
     if (!await hasStaff(msg.member))
       return safeReply(msg, emb(C.err, "staff only."));
-    const username = args[0];
-    if (!username)
+    const input = args[0];
+    if (!input)
       return safeReply(
         msg,
-        emb(C.warn, `usage: \`${prefix}runban <username>\``)
+        emb(C.warn, `usage: \`${prefix}runban <username or userid>\``)
       );
     const d = await loadData();
     const gameId = d.universeId;
@@ -1217,17 +1257,17 @@ const prefixHandlers = {
       return safeReply(msg, emb(C.err, "universe ID not set."));
     const status = await safeReply(msg, emb(C.info, "looking up user..."));
     if (!status) return;
-    const user = await getRobloxUser(username);
+    const user = await resolveRobloxId(input);
     if (!user)
       return safeEdit(
         status,
-        emb(C.err, `no Roblox user found for **${username}**.`)
+        emb(C.err, `no Roblox user found for **${input}**.`)
       );
     const token = mkToken();
     setPending(token, {
       type: "unban",
       userId: user.id,
-      username,
+      username: user.name,
       displayName: user.displayName,
       gameId,
       by: msg.author.username,
@@ -1237,7 +1277,7 @@ const prefixHandlers = {
       ...emb(
         C.warn,
         [
-          `**Roblox User:** ${user.displayName} (\`${username}\`)`,
+          `**Roblox User:** ${user.displayName} (\`${user.name}\`)`,
           `**User ID:** \`${user.id}\``
         ].join("\n"),
         "Confirm Unban"
@@ -1487,7 +1527,9 @@ async function handleSlashWhitelist(interaction) {
         true
       );
     d.whitelist.push(user.id);
-    await saveData(d);
+    const ok = await saveData(d);
+    if (!ok)
+      return safeInteractionReply(interaction, emb(C.err, "failed to save. check JSONBIN env vars."), true);
     return safeInteractionReply(
       interaction,
       emb(C.ok, `**${user.username}** added to whitelist.`)
@@ -1502,7 +1544,9 @@ async function handleSlashWhitelist(interaction) {
         true
       );
     d.whitelist = d.whitelist.filter((id) => id !== user.id);
-    await saveData(d);
+    const ok = await saveData(d);
+    if (!ok)
+      return safeInteractionReply(interaction, emb(C.err, "failed to save. check JSONBIN env vars."), true);
     return safeInteractionReply(
       interaction,
       emb(C.ok, `**${user.username}** removed from whitelist.`)
@@ -1543,7 +1587,9 @@ async function handleSlashSetup(interaction) {
         true
       );
     d.universeId = id;
-    await saveData(d);
+    const ok = await saveData(d);
+    if (!ok)
+      return safeInteractionReply(interaction, emb(C.err, "failed to save. check JSONBIN env vars."), true);
     return safeInteractionReply(
       interaction,
       emb(C.ok, `universe ID set to \`${id}\``)
@@ -1552,7 +1598,9 @@ async function handleSlashSetup(interaction) {
   if (sub === "staffrole") {
     const name = interaction.options.getString("name").slice(0, 100);
     d.staffRole = name;
-    await saveData(d);
+    const ok = await saveData(d);
+    if (!ok)
+      return safeInteractionReply(interaction, emb(C.err, "failed to save. check JSONBIN env vars."), true);
     return safeInteractionReply(
       interaction,
       emb(C.ok, `staff role set to **${name}**`)
@@ -1562,7 +1610,9 @@ async function handleSlashSetup(interaction) {
     const np = interaction.options.getString("prefix").slice(0, 5);
     if (!d.prefixes) d.prefixes = {};
     d.prefixes[interaction.guildId] = np;
-    await saveData(d);
+    const ok = await saveData(d);
+    if (!ok)
+      return safeInteractionReply(interaction, emb(C.err, "failed to save. check JSONBIN env vars."), true);
     return safeInteractionReply(
       interaction,
       emb(C.ok, `prefix set to \`${np}\``)
@@ -1606,8 +1656,6 @@ async function handleSlashDs(interaction) {
       true
     );
   const sub = interaction.options.getSubcommand();
-  const store = interaction.options.getString("store");
-  const key = interaction.options.getString("key");
   await interaction.deferReply();
   try {
     if (sub === "list") {
@@ -1623,6 +1671,8 @@ async function handleSlashDs(interaction) {
         )
       );
     }
+    const store = interaction.options.getString("store");
+    const key = interaction.options.getString("key");
     if (sub === "entries") {
       const data = await dsListEntries(uid, store);
       const keys = data?.keys?.map((k) => `\`${k.key}\``).join("\n");
@@ -1718,7 +1768,7 @@ async function handleSlashBan(interaction) {
       emb(C.err, "staff only."),
       true
     );
-  const username = interaction.options.getString("username");
+  const input = interaction.options.getString("username");
   const reason =
     interaction.options.getString("reason")?.slice(0, 500) ||
     "No reason provided";
@@ -1731,16 +1781,16 @@ async function handleSlashBan(interaction) {
       true
     );
   await interaction.deferReply();
-  const user = await getRobloxUser(username);
+  const user = await resolveRobloxId(input);
   if (!user)
     return interaction.editReply(
-      emb(C.err, `no Roblox user found for **${username}**.`)
+      emb(C.err, `no Roblox user found for **${input}**.`)
     );
   const token = mkToken();
   setPending(token, {
     type: "ban",
     userId: user.id,
-    username,
+    username: user.name,
     displayName: user.displayName,
     reason,
     gameId,
@@ -1751,7 +1801,7 @@ async function handleSlashBan(interaction) {
     ...emb(
       C.warn,
       [
-        `**Roblox User:** ${user.displayName} (\`${username}\`)`,
+        `**Roblox User:** ${user.displayName} (\`${user.name}\`)`,
         `**User ID:** \`${user.id}\``,
         `**Reason:** ${reason}`
       ].join("\n"),
@@ -1768,7 +1818,7 @@ async function handleSlashUnban(interaction) {
       emb(C.err, "staff only."),
       true
     );
-  const username = interaction.options.getString("username");
+  const input = interaction.options.getString("username");
   const d = await loadData();
   const gameId = d.universeId;
   if (!gameId)
@@ -1778,16 +1828,16 @@ async function handleSlashUnban(interaction) {
       true
     );
   await interaction.deferReply();
-  const user = await getRobloxUser(username);
+  const user = await resolveRobloxId(input);
   if (!user)
     return interaction.editReply(
-      emb(C.err, `no Roblox user found for **${username}**.`)
+      emb(C.err, `no Roblox user found for **${input}**.`)
     );
   const token = mkToken();
   setPending(token, {
     type: "unban",
     userId: user.id,
-    username,
+    username: user.name,
     displayName: user.displayName,
     gameId,
     by: interaction.user.username,
@@ -1797,7 +1847,7 @@ async function handleSlashUnban(interaction) {
     ...emb(
       C.warn,
       [
-        `**Roblox User:** ${user.displayName} (\`${username}\`)`,
+        `**Roblox User:** ${user.displayName} (\`${user.name}\`)`,
         `**User ID:** \`${user.id}\``
       ].join("\n"),
       "Confirm Unban"
