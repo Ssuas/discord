@@ -26,10 +26,11 @@ const MAX_EMBED_DESC = 4096;
 const PENDING_TTL = 300_000;
 const POLL_INTERVAL = 3000;
 const POLL_MAX = 20;
+const CF_KV_KEY = "botdata";
 const C = { ok: 0x57f287, err: 0xed4245, info: 0x5865f2, warn: 0xfee75c };
 
 const REQUIRED_ENV = ["DISCORD_TOKEN", "OWNER_ID"];
-const JSONBIN_ENV = ["JSONBIN_ID", "JSONBIN_KEY"];
+const CF_ENV = ["CF_ACCOUNT_ID", "CF_KV_NAMESPACE_ID", "CF_API_TOKEN"];
 
 for (const key of REQUIRED_ENV) {
   if (!process.env[key]) {
@@ -37,7 +38,7 @@ for (const key of REQUIRED_ENV) {
     process.exit(1);
   }
 }
-for (const key of JSONBIN_ENV) {
+for (const key of CF_ENV) {
   if (!process.env[key]) {
     console.warn(`[WARN] Missing env var: ${key} — data will not persist across restarts`);
   }
@@ -58,6 +59,14 @@ const client = new Client({
   ]
 });
 
+function cfKvUrl() {
+  return `https://api.cloudflare.com/client/v4/accounts/${process.env.CF_ACCOUNT_ID}/storage/kv/namespaces/${process.env.CF_KV_NAMESPACE_ID}/values/${CF_KV_KEY}`;
+}
+
+function cfHeaders(extra = {}) {
+  return { "Authorization": `Bearer ${process.env.CF_API_TOKEN}`, ...extra };
+}
+
 async function loadData(bust = false) {
   if (!bust && dataCache && Date.now() < dataCacheTTL) return structuredClone(dataCache);
   const defaults = {
@@ -67,18 +76,17 @@ async function loadData(bust = false) {
     prefixes: {},
     mainDatastore: "MainData_v2"
   };
-  if (!process.env.JSONBIN_ID || !process.env.JSONBIN_KEY) return defaults;
+  if (!process.env.CF_ACCOUNT_ID || !process.env.CF_KV_NAMESPACE_ID || !process.env.CF_API_TOKEN)
+    return defaults;
   try {
-    const res = await fetch(
-      `https://api.jsonbin.io/v3/b/${process.env.JSONBIN_ID}/latest`,
-      { headers: { "X-Master-Key": process.env.JSONBIN_KEY } }
-    );
+    const res = await fetch(cfKvUrl(), { headers: cfHeaders() });
+    if (res.status === 404) return defaults;
     if (!res.ok) {
-      console.error(`[loadData] JSONBin fetch failed: ${res.status}`);
+      console.error(`[loadData] CF KV fetch failed: ${res.status}`);
       return defaults;
     }
-    const json = await res.json();
-    dataCache = { ...defaults, ...json.record };
+    const record = await res.json();
+    dataCache = { ...defaults, ...record };
     dataCacheTTL = Date.now() + CACHE_DURATION;
     return structuredClone(dataCache);
   } catch (e) {
@@ -88,28 +96,27 @@ async function loadData(bust = false) {
 }
 
 async function saveData(d) {
-  if (!process.env.JSONBIN_ID || !process.env.JSONBIN_KEY) {
-    console.error("[saveData] JSONBin env vars not set — cannot persist data");
+  if (!process.env.CF_ACCOUNT_ID || !process.env.CF_KV_NAMESPACE_ID || !process.env.CF_API_TOKEN) {
+    console.error("[saveData] CF env vars not set — cannot persist data");
     return false;
   }
-  const res = await fetch(
-    `https://api.jsonbin.io/v3/b/${process.env.JSONBIN_ID}`,
-    {
+  try {
+    const res = await fetch(cfKvUrl(), {
       method: "PUT",
-      headers: {
-        "X-Master-Key": process.env.JSONBIN_KEY,
-        "Content-Type": "application/json"
-      },
+      headers: cfHeaders({ "Content-Type": "application/json" }),
       body: JSON.stringify(d)
+    });
+    if (!res.ok) {
+      console.error("[saveData] failed:", res.status, await res.text());
+      return false;
     }
-  );
-  if (!res.ok) {
-    console.error("saveData failed:", res.status, await res.text());
+    dataCache = structuredClone(d);
+    dataCacheTTL = Date.now() + CACHE_DURATION;
+    return true;
+  } catch (e) {
+    console.error("[saveData] error:", e.message);
     return false;
   }
-  dataCache = structuredClone(d);
-  dataCacheTTL = Date.now() + CACHE_DURATION;
-  return true;
 }
 
 function isOwner(userId) {
@@ -137,16 +144,12 @@ function md5b64(str) {
 }
 
 async function getRobloxUser(username) {
-  if (!username || typeof username !== "string" || username.length > 20)
-    return null;
+  if (!username || typeof username !== "string" || username.length > 20) return null;
   try {
     const res = await fetch("https://users.roblox.com/v1/usernames/users", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        usernames: [username],
-        excludeBannedUsers: false
-      })
+      body: JSON.stringify({ usernames: [username], excludeBannedUsers: false })
     });
     if (!res.ok) return null;
     const data = await res.json();
@@ -173,24 +176,19 @@ async function resolveRobloxId(input) {
   const clean = input.trim().slice(0, 50);
   if (/^\d+$/.test(clean)) {
     const u = await getRobloxUserById(clean);
-    return u
-      ? { id: String(u.id), name: u.name, displayName: u.displayName }
-      : null;
+    return u ? { id: String(u.id), name: u.name, displayName: u.displayName } : null;
   }
   const u = await getRobloxUser(clean);
-  return u
-    ? { id: String(u.id), name: u.name, displayName: u.displayName }
-    : null;
+  return u ? { id: String(u.id), name: u.name, displayName: u.displayName } : null;
 }
 
 async function pollOperation(opPath) {
   for (let i = 0; i < POLL_MAX; i++) {
     await new Promise((r) => setTimeout(r, POLL_INTERVAL));
     try {
-      const res = await fetch(
-        `https://apis.roblox.com/assets/v1/${opPath}`,
-        { headers: { "x-api-key": process.env.ROBLOX_API_KEY } }
-      );
+      const res = await fetch(`https://apis.roblox.com/assets/v1/${opPath}`, {
+        headers: { "x-api-key": process.env.ROBLOX_API_KEY }
+      });
       if (!res.ok) continue;
       const data = await res.json();
       if (data.done) return data.response?.assetId;
@@ -221,22 +219,14 @@ async function uploadFile(file) {
       assetType: "Audio",
       displayName: file.name.replace(/\.mp3$/i, "").slice(0, 50),
       description: "",
-      creationContext: {
-        creator: { userId: process.env.ROBLOX_USER_ID }
-      }
+      creationContext: { creator: { userId: process.env.ROBLOX_USER_ID } }
     }),
     { contentType: "application/json" }
   );
-  form.append("fileContent", buf, {
-    filename: file.name,
-    contentType: "audio/mpeg"
-  });
+  form.append("fileContent", buf, { filename: file.name, contentType: "audio/mpeg" });
   const res = await fetch("https://apis.roblox.com/assets/v1/assets", {
     method: "POST",
-    headers: {
-      "x-api-key": process.env.ROBLOX_API_KEY,
-      ...form.getHeaders()
-    },
+    headers: { "x-api-key": process.env.ROBLOX_API_KEY, ...form.getHeaders() },
     body: form
   });
   const data = await res.json();
@@ -282,10 +272,7 @@ async function dsSetEntry(uid, store, key, value) {
     `${dsBase(uid)}/datastore/entries/entry?datastoreName=${encodeURIComponent(store)}&entryKey=${encodeURIComponent(key)}`,
     {
       method: "POST",
-      headers: dsH({
-        "Content-Type": "application/json",
-        "content-md5": md5b64(value)
-      }),
+      headers: dsH({ "Content-Type": "application/json", "content-md5": md5b64(value) }),
       body: value
     }
   );
@@ -332,23 +319,15 @@ async function setPlayerData(uid, userId, pdata, dsName) {
 }
 
 function emb(color, desc, title) {
-  const e = new EmbedBuilder()
-    .setColor(color)
-    .setDescription(desc.slice(0, MAX_EMBED_DESC));
+  const e = new EmbedBuilder().setColor(color).setDescription(desc.slice(0, MAX_EMBED_DESC));
   if (title) e.setTitle(title.slice(0, 256));
   return { embeds: [e] };
 }
 
 function confirmRow(token) {
   return new ActionRowBuilder().addComponents(
-    new ButtonBuilder()
-      .setCustomId(`confirm_${token}`)
-      .setLabel("Confirm")
-      .setStyle(ButtonStyle.Danger),
-    new ButtonBuilder()
-      .setCustomId(`cancel_${token}`)
-      .setLabel("Cancel")
-      .setStyle(ButtonStyle.Secondary)
+    new ButtonBuilder().setCustomId(`confirm_${token}`).setLabel("Confirm").setStyle(ButtonStyle.Danger),
+    new ButtonBuilder().setCustomId(`cancel_${token}`).setLabel("Cancel").setStyle(ButtonStyle.Secondary)
   );
 }
 
@@ -430,9 +409,7 @@ async function requireUniverse() {
 
 async function safeReply(target, content) {
   try {
-    return await target.reply(
-      typeof content === "string" ? emb(C.info, content) : content
-    );
+    return await target.reply(typeof content === "string" ? emb(C.info, content) : content);
   } catch (e) {
     console.error("safeReply failed:", e.message);
     return null;
@@ -441,9 +418,7 @@ async function safeReply(target, content) {
 
 async function safeEdit(msg, content) {
   try {
-    return await msg.edit(
-      typeof content === "string" ? emb(C.info, content) : content
-    );
+    return await msg.edit(typeof content === "string" ? emb(C.info, content) : content);
   } catch (e) {
     console.error("safeEdit failed:", e.message);
     return null;
@@ -452,9 +427,7 @@ async function safeEdit(msg, content) {
 
 async function safeInteractionReply(interaction, content, ephemeral = false) {
   try {
-    if (interaction.replied || interaction.deferred) {
-      return await interaction.editReply(content);
-    }
+    if (interaction.replied || interaction.deferred) return await interaction.editReply(content);
     return await interaction.reply({ ...content, ephemeral });
   } catch (e) {
     console.error("safeInteractionReply failed:", e.message);
@@ -464,9 +437,7 @@ async function safeInteractionReply(interaction, content, ephemeral = false) {
 
 async function safeInteractionUpdate(interaction, content) {
   try {
-    if (interaction.replied || interaction.deferred) {
-      return await interaction.editReply(content);
-    }
+    if (interaction.replied || interaction.deferred) return await interaction.editReply(content);
     return await interaction.update(content);
   } catch (e) {
     console.error("safeInteractionUpdate failed:", e.message);
@@ -479,10 +450,7 @@ const uploadSlash = new SlashCommandBuilder()
   .setDescription("Upload up to 5 MP3s to Roblox");
 for (let i = 1; i <= FILE_COUNT; i++) {
   uploadSlash.addAttachmentOption((o) =>
-    o
-      .setName(`file${i}`)
-      .setDescription(`MP3 file ${i}`)
-      .setRequired(i === 1)
+    o.setName(`file${i}`).setDescription(`MP3 file ${i}`).setRequired(i === 1)
   );
 }
 
@@ -490,155 +458,80 @@ const whitelistSlash = new SlashCommandBuilder()
   .setName("whitelist")
   .setDescription("Manage upload whitelist")
   .addSubcommand((s) =>
-    s
-      .setName("add")
-      .setDescription("Whitelist a user")
-      .addUserOption((o) =>
-        o.setName("user").setDescription("Discord user").setRequired(true)
-      )
+    s.setName("add").setDescription("Whitelist a user")
+      .addUserOption((o) => o.setName("user").setDescription("Discord user").setRequired(true))
   )
   .addSubcommand((s) =>
-    s
-      .setName("remove")
-      .setDescription("Remove a user")
-      .addUserOption((o) =>
-        o.setName("user").setDescription("Discord user").setRequired(true)
-      )
+    s.setName("remove").setDescription("Remove a user")
+      .addUserOption((o) => o.setName("user").setDescription("Discord user").setRequired(true))
   )
-  .addSubcommand((s) =>
-    s.setName("list").setDescription("Show whitelisted users")
-  );
+  .addSubcommand((s) => s.setName("list").setDescription("Show whitelisted users"));
 
 const setupSlash = new SlashCommandBuilder()
   .setName("setup")
   .setDescription("Configure bot settings")
   .addSubcommand((s) =>
-    s
-      .setName("universe")
-      .setDescription("Set universe ID")
-      .addStringOption((o) =>
-        o.setName("id").setDescription("Universe ID").setRequired(true)
-      )
+    s.setName("universe").setDescription("Set universe ID")
+      .addStringOption((o) => o.setName("id").setDescription("Universe ID").setRequired(true))
   )
   .addSubcommand((s) =>
-    s
-      .setName("staffrole")
-      .setDescription("Set staff role")
-      .addStringOption((o) =>
-        o.setName("name").setDescription("Exact role name").setRequired(true)
-      )
+    s.setName("staffrole").setDescription("Set staff role")
+      .addStringOption((o) => o.setName("name").setDescription("Exact role name").setRequired(true))
   )
   .addSubcommand((s) =>
-    s
-      .setName("prefix")
-      .setDescription("Set prefix")
-      .addStringOption((o) =>
-        o.setName("prefix").setDescription("New prefix").setRequired(true)
-      )
+    s.setName("prefix").setDescription("Set prefix")
+      .addStringOption((o) => o.setName("prefix").setDescription("New prefix").setRequired(true))
   )
-  .addSubcommand((s) =>
-    s.setName("show").setDescription("Show current settings")
-  );
+  .addSubcommand((s) => s.setName("show").setDescription("Show current settings"));
 
 const dsSlash = new SlashCommandBuilder()
   .setName("ds")
   .setDescription("Manage Roblox datastores")
   .addSubcommand((s) => s.setName("list").setDescription("List all datastores"))
   .addSubcommand((s) =>
-    s
-      .setName("entries")
-      .setDescription("List entries")
-      .addStringOption((o) =>
-        o.setName("store").setDescription("Datastore name").setRequired(true)
-      )
+    s.setName("entries").setDescription("List entries")
+      .addStringOption((o) => o.setName("store").setDescription("Datastore name").setRequired(true))
   )
   .addSubcommand((s) =>
-    s
-      .setName("get")
-      .setDescription("Get entry")
-      .addStringOption((o) =>
-        o.setName("store").setDescription("Datastore name").setRequired(true)
-      )
-      .addStringOption((o) =>
-        o.setName("key").setDescription("Entry key").setRequired(true)
-      )
+    s.setName("get").setDescription("Get entry")
+      .addStringOption((o) => o.setName("store").setDescription("Datastore name").setRequired(true))
+      .addStringOption((o) => o.setName("key").setDescription("Entry key").setRequired(true))
   )
   .addSubcommand((s) =>
-    s
-      .setName("set")
-      .setDescription("Set entry")
-      .addStringOption((o) =>
-        o.setName("store").setDescription("Datastore name").setRequired(true)
-      )
-      .addStringOption((o) =>
-        o.setName("key").setDescription("Entry key").setRequired(true)
-      )
-      .addStringOption((o) =>
-        o.setName("value").setDescription("Value").setRequired(true)
-      )
+    s.setName("set").setDescription("Set entry")
+      .addStringOption((o) => o.setName("store").setDescription("Datastore name").setRequired(true))
+      .addStringOption((o) => o.setName("key").setDescription("Entry key").setRequired(true))
+      .addStringOption((o) => o.setName("value").setDescription("Value").setRequired(true))
   )
   .addSubcommand((s) =>
-    s
-      .setName("delete")
-      .setDescription("Delete entry")
-      .addStringOption((o) =>
-        o.setName("store").setDescription("Datastore name").setRequired(true)
-      )
-      .addStringOption((o) =>
-        o.setName("key").setDescription("Entry key").setRequired(true)
-      )
+    s.setName("delete").setDescription("Delete entry")
+      .addStringOption((o) => o.setName("store").setDescription("Datastore name").setRequired(true))
+      .addStringOption((o) => o.setName("key").setDescription("Entry key").setRequired(true))
   )
   .addSubcommand((s) =>
-    s
-      .setName("increment")
-      .setDescription("Increment entry")
-      .addStringOption((o) =>
-        o.setName("store").setDescription("Datastore name").setRequired(true)
-      )
-      .addStringOption((o) =>
-        o.setName("key").setDescription("Entry key").setRequired(true)
-      )
-      .addNumberOption((o) =>
-        o.setName("amount").setDescription("Amount").setRequired(true)
-      )
+    s.setName("increment").setDescription("Increment entry")
+      .addStringOption((o) => o.setName("store").setDescription("Datastore name").setRequired(true))
+      .addStringOption((o) => o.setName("key").setDescription("Entry key").setRequired(true))
+      .addNumberOption((o) => o.setName("amount").setDescription("Amount").setRequired(true))
   )
   .addSubcommand((s) =>
-    s
-      .setName("versions")
-      .setDescription("List versions")
-      .addStringOption((o) =>
-        o.setName("store").setDescription("Datastore name").setRequired(true)
-      )
-      .addStringOption((o) =>
-        o.setName("key").setDescription("Entry key").setRequired(true)
-      )
+    s.setName("versions").setDescription("List versions")
+      .addStringOption((o) => o.setName("store").setDescription("Datastore name").setRequired(true))
+      .addStringOption((o) => o.setName("key").setDescription("Entry key").setRequired(true))
   );
 
 const banSlash = new SlashCommandBuilder()
   .setName("rban")
   .setDescription("Ban a Roblox user")
-  .addStringOption((o) =>
-    o.setName("username").setDescription("Roblox username or user ID").setRequired(true)
-  )
-  .addStringOption((o) =>
-    o.setName("reason").setDescription("Ban reason")
-  );
+  .addStringOption((o) => o.setName("username").setDescription("Roblox username or user ID").setRequired(true))
+  .addStringOption((o) => o.setName("reason").setDescription("Ban reason"));
 
 const unbanSlash = new SlashCommandBuilder()
   .setName("runban")
   .setDescription("Unban a Roblox user")
-  .addStringOption((o) =>
-    o.setName("username").setDescription("Roblox username or user ID").setRequired(true)
-  );
+  .addStringOption((o) => o.setName("username").setDescription("Roblox username or user ID").setRequired(true));
 
-const slashCommands = [
-  uploadSlash,
-  whitelistSlash,
-  setupSlash,
-  dsSlash,
-  banSlash,
-  unbanSlash
-];
+const slashCommands = [uploadSlash, whitelistSlash, setupSlash, dsSlash, banSlash, unbanSlash];
 
 client.once("ready", async () => {
   try {
@@ -654,29 +547,19 @@ client.once("ready", async () => {
 
 const prefixHandlers = {
   async setmainds(msg, args, prefix) {
-    if (!isOwner(msg.author.id))
-      return safeReply(msg, emb(C.err, "owner only."));
-    if (!args[0])
-      return safeReply(
-        msg,
-        emb(C.warn, `usage: \`${prefix}setmainds <datastore name>\``)
-      );
+    if (!isOwner(msg.author.id)) return safeReply(msg, emb(C.err, "owner only."));
+    if (!args[0]) return safeReply(msg, emb(C.warn, `usage: \`${prefix}setmainds <datastore name>\``));
     const name = args[0].slice(0, 100);
     const d = await loadData(true);
     d.mainDatastore = name;
     const ok = await saveData(d);
-    if (!ok) return safeReply(msg, emb(C.err, "failed to save. check JSONBIN env vars."));
+    if (!ok) return safeReply(msg, emb(C.err, "failed to save. check CF env vars."));
     return safeReply(msg, emb(C.ok, `main datastore set to \`${name}\``));
   },
 
   async getstats(msg, args, prefix) {
-    if (!isOwner(msg.author.id))
-      return safeReply(msg, emb(C.err, "owner only."));
-    if (!args[0])
-      return safeReply(
-        msg,
-        emb(C.warn, `usage: \`${prefix}getstats <username/userid>\``)
-      );
+    if (!isOwner(msg.author.id)) return safeReply(msg, emb(C.err, "owner only."));
+    if (!args[0]) return safeReply(msg, emb(C.warn, `usage: \`${prefix}getstats <username/userid>\``));
     const status = await safeReply(msg, emb(C.info, "fetching..."));
     if (!status) return;
     try {
@@ -686,14 +569,9 @@ const prefixHandlers = {
       const user = await resolveRobloxId(args[0]);
       if (!user) return safeEdit(status, emb(C.err, "user not found."));
       const pdata = await getPlayerData(d.universeId, user.id, dsName);
-      if (!pdata)
-        return safeEdit(
-          status,
-          emb(C.err, `no data for **${user.name}**.`)
-        );
+      if (!pdata) return safeEdit(status, emb(C.err, `no data for **${user.name}**.`));
       const data = pdata.Data;
-      if (!data)
-        return safeEdit(status, emb(C.err, "player data has no Data field."));
+      if (!data) return safeEdit(status, emb(C.err, "player data has no Data field."));
       const quest = data.quest || {};
       const trollSavesStr = trunc(fmtSaves(data.troll_saves || {}));
       const itemSavesStr = trunc(fmtSaves(data.item_saves || {}));
@@ -702,30 +580,12 @@ const prefixHandlers = {
         .setColor(C.info)
         .setTitle(`Stats — ${user.displayName} (${user.name})`)
         .addFields(
-          {
-            name: "💰 Coins",
-            value: `\`${(data.coins || 0).toLocaleString()}\``,
-            inline: true
-          },
-          {
-            name: "🎭 Stand",
-            value: `\`${data.troll_stand || "none"}\``,
-            inline: true
-          },
-          {
-            name: "🔢 Type",
-            value: `\`${data.type_i ?? "?"}\``,
-            inline: true
-          },
+          { name: "💰 Coins", value: `\`${(data.coins || 0).toLocaleString()}\``, inline: true },
+          { name: "🎭 Stand", value: `\`${data.troll_stand || "none"}\``, inline: true },
+          { name: "🔢 Type", value: `\`${data.type_i ?? "?"}\``, inline: true },
           { name: "📋 Quest", value: questStr },
-          {
-            name: `🎭 Troll Saves (${Object.keys(data.troll_saves || {}).length})`,
-            value: trollSavesStr
-          },
-          {
-            name: `🎒 Item Saves (${Object.keys(data.item_saves || {}).length})`,
-            value: itemSavesStr
-          }
+          { name: `🎭 Troll Saves (${Object.keys(data.troll_saves || {}).length})`, value: trollSavesStr },
+          { name: `🎒 Item Saves (${Object.keys(data.item_saves || {}).length})`, value: itemSavesStr }
         )
         .setFooter({ text: `Player_${user.id} | ${dsName}` });
       await safeEdit(status, { embeds: [embed] });
@@ -744,13 +604,8 @@ const prefixHandlers = {
   },
 
   async _setSaveSlots(msg, args, prefix, field, label, cmdName) {
-    if (!isOwner(msg.author.id))
-      return safeReply(msg, emb(C.err, "owner only."));
-    if (!args[0])
-      return safeReply(
-        msg,
-        emb(C.warn, `usage: \`${prefix}${cmdName} <username/userid>\``)
-      );
+    if (!isOwner(msg.author.id)) return safeReply(msg, emb(C.err, "owner only."));
+    if (!args[0]) return safeReply(msg, emb(C.warn, `usage: \`${prefix}${cmdName} <username/userid>\``));
     const status = await safeReply(msg, emb(C.info, "fetching..."));
     if (!status) return;
     try {
@@ -760,11 +615,7 @@ const prefixHandlers = {
       const user = await resolveRobloxId(args[0]);
       if (!user) return safeEdit(status, emb(C.err, "user not found."));
       const pdata = await getPlayerData(d.universeId, user.id, dsName);
-      if (!pdata)
-        return safeEdit(
-          status,
-          emb(C.err, `no data for **${user.name}**.`)
-        );
+      if (!pdata) return safeEdit(status, emb(C.err, `no data for **${user.name}**.`));
       const saves = pdata.Data?.[field] || {};
       if (!Object.keys(saves).length)
         return safeEdit(status, emb(C.warn, `**${user.name}** has no ${label.toLowerCase()}.`));
@@ -787,11 +638,7 @@ const prefixHandlers = {
           new EmbedBuilder()
             .setColor(C.info)
             .setTitle(`${label} — ${user.displayName} (${user.name})`)
-            .setDescription(
-              preview.length > 2000
-                ? preview.slice(0, 2000) + "..."
-                : preview || "empty"
-            )
+            .setDescription(preview.length > 2000 ? preview.slice(0, 2000) + "..." : preview || "empty")
             .setFooter({ text: "Select a slot below to edit" })
         ],
         components: selectRow ? [selectRow] : []
@@ -803,13 +650,9 @@ const prefixHandlers = {
   },
 
   async setcoins(msg, args, prefix) {
-    if (!isOwner(msg.author.id))
-      return safeReply(msg, emb(C.err, "owner only."));
+    if (!isOwner(msg.author.id)) return safeReply(msg, emb(C.err, "owner only."));
     if (!args[0] || !args[1])
-      return safeReply(
-        msg,
-        emb(C.warn, `usage: \`${prefix}setcoins <username/userid> <amount>\``)
-      );
+      return safeReply(msg, emb(C.warn, `usage: \`${prefix}setcoins <username/userid> <amount>\``));
     const amount = parseInt(args[1]);
     if (isNaN(amount) || amount < 0 || amount > Number.MAX_SAFE_INTEGER)
       return safeReply(msg, emb(C.err, "invalid amount."));
@@ -822,11 +665,7 @@ const prefixHandlers = {
       const user = await resolveRobloxId(args[0]);
       if (!user) return safeEdit(status, emb(C.err, "user not found."));
       const pdata = await getPlayerData(d.universeId, user.id, dsName);
-      if (!pdata)
-        return safeEdit(
-          status,
-          emb(C.err, `no data for **${user.name}**.`)
-        );
+      if (!pdata) return safeEdit(status, emb(C.err, `no data for **${user.name}**.`));
       const oldCoins = pdata.Data?.coins || 0;
       const newPdata = structuredClone(pdata);
       newPdata.Data.coins = amount;
@@ -840,14 +679,10 @@ const prefixHandlers = {
         initiator: msg.author.id
       });
       await safeEdit(status, {
-        ...emb(
-          C.warn,
-          [
-            `**Player:** ${user.displayName} (\`${user.name}\`)`,
-            `**Coins:** \`${oldCoins.toLocaleString()}\` → \`${amount.toLocaleString()}\``
-          ].join("\n"),
-          "Confirm Set Coins"
-        ),
+        ...emb(C.warn, [
+          `**Player:** ${user.displayName} (\`${user.name}\`)`,
+          `**Coins:** \`${oldCoins.toLocaleString()}\` → \`${amount.toLocaleString()}\``
+        ].join("\n"), "Confirm Set Coins"),
         components: [confirmRow(token)]
       });
     } catch (e) {
@@ -857,19 +692,11 @@ const prefixHandlers = {
   },
 
   async setstand(msg, args, prefix) {
-    if (!isOwner(msg.author.id))
-      return safeReply(msg, emb(C.err, "owner only."));
+    if (!isOwner(msg.author.id)) return safeReply(msg, emb(C.err, "owner only."));
     const stand = args.slice(1).join(" ");
     if (!args[0] || !stand)
-      return safeReply(
-        msg,
-        emb(
-          C.warn,
-          `usage: \`${prefix}setstand <username/userid> <stand name>\``
-        )
-      );
-    if (stand.length > 200)
-      return safeReply(msg, emb(C.err, "stand name too long (max 200)."));
+      return safeReply(msg, emb(C.warn, `usage: \`${prefix}setstand <username/userid> <stand name>\``));
+    if (stand.length > 200) return safeReply(msg, emb(C.err, "stand name too long (max 200)."));
     const status = await safeReply(msg, emb(C.info, "fetching..."));
     if (!status) return;
     try {
@@ -879,11 +706,7 @@ const prefixHandlers = {
       const user = await resolveRobloxId(args[0]);
       if (!user) return safeEdit(status, emb(C.err, "user not found."));
       const pdata = await getPlayerData(d.universeId, user.id, dsName);
-      if (!pdata)
-        return safeEdit(
-          status,
-          emb(C.err, `no data for **${user.name}**.`)
-        );
+      if (!pdata) return safeEdit(status, emb(C.err, `no data for **${user.name}**.`));
       const oldStand = pdata.Data?.troll_stand || "none";
       const newPdata = structuredClone(pdata);
       newPdata.Data.troll_stand = stand;
@@ -897,14 +720,10 @@ const prefixHandlers = {
         initiator: msg.author.id
       });
       await safeEdit(status, {
-        ...emb(
-          C.warn,
-          [
-            `**Player:** ${user.displayName} (\`${user.name}\`)`,
-            `**Stand:** \`${oldStand}\` → \`${stand}\``
-          ].join("\n"),
-          "Confirm Set Stand"
-        ),
+        ...emb(C.warn, [
+          `**Player:** ${user.displayName} (\`${user.name}\`)`,
+          `**Stand:** \`${oldStand}\` → \`${stand}\``
+        ].join("\n"), "Confirm Set Stand"),
         components: [confirmRow(token)]
       });
     } catch (e) {
@@ -914,25 +733,16 @@ const prefixHandlers = {
   },
 
   async setquest(msg, args, prefix) {
-    if (!isOwner(msg.author.id))
-      return safeReply(msg, emb(C.err, "owner only."));
+    if (!isOwner(msg.author.id)) return safeReply(msg, emb(C.err, "owner only."));
     if (args.length < 5)
-      return safeReply(
-        msg,
-        emb(
-          C.warn,
-          `usage: \`${prefix}setquest <user> <name> <goal> <progress> <reward>\` (use _ for spaces)`
-        )
-      );
+      return safeReply(msg, emb(C.warn, `usage: \`${prefix}setquest <user> <name> <goal> <progress> <reward>\` (use _ for spaces)`));
     const [input, rawName, goalStr, progressStr, ...rewardParts] = args;
     const questName = rawName.replace(/_/g, " ").slice(0, 200);
     const goal = parseInt(goalStr);
     const progress = parseInt(progressStr);
     const reward = rewardParts.join(" ").replace(/_/g, " ").slice(0, 200);
-    if (isNaN(goal) || isNaN(progress))
-      return safeReply(msg, emb(C.err, "goal and progress must be numbers."));
-    if (goal < 0 || progress < 0)
-      return safeReply(msg, emb(C.err, "goal and progress must be non-negative."));
+    if (isNaN(goal) || isNaN(progress)) return safeReply(msg, emb(C.err, "goal and progress must be numbers."));
+    if (goal < 0 || progress < 0) return safeReply(msg, emb(C.err, "goal and progress must be non-negative."));
     const status = await safeReply(msg, emb(C.info, "fetching..."));
     if (!status) return;
     try {
@@ -942,18 +752,9 @@ const prefixHandlers = {
       const user = await resolveRobloxId(input);
       if (!user) return safeEdit(status, emb(C.err, "user not found."));
       const pdata = await getPlayerData(d.universeId, user.id, dsName);
-      if (!pdata)
-        return safeEdit(
-          status,
-          emb(C.err, `no data for **${user.name}**.`)
-        );
+      if (!pdata) return safeEdit(status, emb(C.err, `no data for **${user.name}**.`));
       const newPdata = structuredClone(pdata);
-      newPdata.Data.quest = {
-        Name: questName,
-        Goal: goal,
-        Progress: progress,
-        Reward: reward
-      };
+      newPdata.Data.quest = { Name: questName, Goal: goal, Progress: progress, Reward: reward };
       const token = mkToken();
       setPending(token, {
         type: "generic_confirm",
@@ -964,16 +765,12 @@ const prefixHandlers = {
         initiator: msg.author.id
       });
       await safeEdit(status, {
-        ...emb(
-          C.warn,
-          [
-            `**Player:** ${user.displayName} (\`${user.name}\`)`,
-            `**Name:** ${questName}`,
-            `**Goal:** ${goal} | **Progress:** ${progress}`,
-            `**Reward:** ${reward}`
-          ].join("\n"),
-          "Confirm Set Quest"
-        ),
+        ...emb(C.warn, [
+          `**Player:** ${user.displayName} (\`${user.name}\`)`,
+          `**Name:** ${questName}`,
+          `**Goal:** ${goal} | **Progress:** ${progress}`,
+          `**Reward:** ${reward}`
+        ].join("\n"), "Confirm Set Quest"),
         components: [confirmRow(token)]
       });
     } catch (e) {
@@ -983,13 +780,8 @@ const prefixHandlers = {
   },
 
   async viewraw(msg, args, prefix) {
-    if (!isOwner(msg.author.id))
-      return safeReply(msg, emb(C.err, "owner only."));
-    if (!args[0])
-      return safeReply(
-        msg,
-        emb(C.warn, `usage: \`${prefix}viewraw <username/userid>\``)
-      );
+    if (!isOwner(msg.author.id)) return safeReply(msg, emb(C.err, "owner only."));
+    if (!args[0]) return safeReply(msg, emb(C.warn, `usage: \`${prefix}viewraw <username/userid>\``));
     const status = await safeReply(msg, emb(C.info, "fetching..."));
     if (!status) return;
     try {
@@ -998,22 +790,10 @@ const prefixHandlers = {
       const dsName = d.mainDatastore || "MainData_v2";
       const user = await resolveRobloxId(args[0]);
       if (!user) return safeEdit(status, emb(C.err, "user not found."));
-      const { status: httpStatus, body } = await dsGetEntry(
-        d.universeId,
-        dsName,
-        `Player_${user.id}`
-      );
-      if (httpStatus !== 200)
-        return safeEdit(
-          status,
-          emb(C.err, `no data found (${httpStatus}).`)
-        );
-      const preview =
-        body.length > 1800 ? body.slice(0, 1800) + "\n...(truncated)" : body;
-      await safeEdit(
-        status,
-        emb(C.info, `\`\`\`json\n${preview}\n\`\`\``, `Raw — Player_${user.id}`)
-      );
+      const { status: httpStatus, body } = await dsGetEntry(d.universeId, dsName, `Player_${user.id}`);
+      if (httpStatus !== 200) return safeEdit(status, emb(C.err, `no data found (${httpStatus}).`));
+      const preview = body.length > 1800 ? body.slice(0, 1800) + "\n...(truncated)" : body;
+      await safeEdit(status, emb(C.info, `\`\`\`json\n${preview}\n\`\`\``, `Raw — Player_${user.id}`));
     } catch (e) {
       console.error("viewraw error:", e);
       await safeEdit(status, emb(C.err, `error: ${e.message}`));
@@ -1021,44 +801,25 @@ const prefixHandlers = {
   },
 
   async setprefix(msg, args, prefix) {
-    if (!await hasStaff(msg.member))
-      return safeReply(msg, emb(C.err, "staff only."));
+    if (!await hasStaff(msg.member)) return safeReply(msg, emb(C.err, "staff only."));
     const np = args[0];
-    if (!np)
-      return safeReply(
-        msg,
-        emb(C.warn, `usage: \`${prefix}setprefix <new prefix>\``)
-      );
-    if (np.length > 5)
-      return safeReply(msg, emb(C.err, "prefix too long (max 5 chars)."));
+    if (!np) return safeReply(msg, emb(C.warn, `usage: \`${prefix}setprefix <new prefix>\``));
+    if (np.length > 5) return safeReply(msg, emb(C.err, "prefix too long (max 5 chars)."));
     const d = await loadData(true);
     if (!d.prefixes) d.prefixes = {};
     d.prefixes[msg.guild.id] = np;
     const ok = await saveData(d);
-    if (!ok) return safeReply(msg, emb(C.err, "failed to save. check JSONBIN env vars."));
+    if (!ok) return safeReply(msg, emb(C.err, "failed to save. check CF env vars."));
     return safeReply(msg, emb(C.ok, `prefix set to \`${np}\``));
   },
 
   async upload(msg, args, prefix) {
-    if (
-      !await isWhitelisted(msg.author.id) &&
-      !await hasStaff(msg.member)
-    )
+    if (!await isWhitelisted(msg.author.id) && !await hasStaff(msg.member))
       return safeReply(msg, emb(C.err, "you're not whitelisted."));
-    const attachments = [...msg.attachments.values()].filter((a) =>
-      a.name?.toLowerCase().endsWith(".mp3")
-    );
-    if (!attachments.length)
-      return safeReply(msg, emb(C.err, "attach at least one mp3 file."));
-    if (attachments.length > FILE_COUNT)
-      return safeReply(
-        msg,
-        emb(C.err, `max ${FILE_COUNT} files at a time.`)
-      );
-    const status = await safeReply(
-      msg,
-      emb(C.info, `uploading ${attachments.length} file(s)...`)
-    );
+    const attachments = [...msg.attachments.values()].filter((a) => a.name?.toLowerCase().endsWith(".mp3"));
+    if (!attachments.length) return safeReply(msg, emb(C.err, "attach at least one mp3 file."));
+    if (attachments.length > FILE_COUNT) return safeReply(msg, emb(C.err, `max ${FILE_COUNT} files at a time.`));
+    const status = await safeReply(msg, emb(C.info, `uploading ${attachments.length} file(s)...`));
     if (!status) return;
     const lines = [];
     for (const file of attachments) {
@@ -1073,150 +834,81 @@ const prefixHandlers = {
   },
 
   async whitelist(msg, args, prefix) {
-    if (!isOwner(msg.author.id))
-      return safeReply(msg, emb(C.err, "owner only."));
+    if (!isOwner(msg.author.id)) return safeReply(msg, emb(C.err, "owner only."));
     const sub = args[0];
     const d = await loadData(true);
     if (sub === "add") {
       const mentioned = msg.mentions.users.first();
-      if (!mentioned)
-        return safeReply(
-          msg,
-          emb(C.warn, `usage: \`${prefix}whitelist add @user\``)
-        );
+      if (!mentioned) return safeReply(msg, emb(C.warn, `usage: \`${prefix}whitelist add @user\``));
       if (d.whitelist.includes(mentioned.id))
-        return safeReply(
-          msg,
-          emb(C.warn, `${mentioned.username} is already whitelisted.`)
-        );
+        return safeReply(msg, emb(C.warn, `${mentioned.username} is already whitelisted.`));
       d.whitelist.push(mentioned.id);
       const ok = await saveData(d);
-      if (!ok) return safeReply(msg, emb(C.err, "failed to save. check JSONBIN env vars."));
-      return safeReply(
-        msg,
-        emb(C.ok, `**${mentioned.username}** added to whitelist.`)
-      );
+      if (!ok) return safeReply(msg, emb(C.err, "failed to save. check CF env vars."));
+      return safeReply(msg, emb(C.ok, `**${mentioned.username}** added to whitelist.`));
     }
     if (sub === "remove") {
       const mentioned = msg.mentions.users.first();
-      if (!mentioned)
-        return safeReply(
-          msg,
-          emb(C.warn, `usage: \`${prefix}whitelist remove @user\``)
-        );
+      if (!mentioned) return safeReply(msg, emb(C.warn, `usage: \`${prefix}whitelist remove @user\``));
       if (!d.whitelist.includes(mentioned.id))
-        return safeReply(
-          msg,
-          emb(C.warn, `${mentioned.username} isn't whitelisted.`)
-        );
+        return safeReply(msg, emb(C.warn, `${mentioned.username} isn't whitelisted.`));
       d.whitelist = d.whitelist.filter((id) => id !== mentioned.id);
       const ok = await saveData(d);
-      if (!ok) return safeReply(msg, emb(C.err, "failed to save. check JSONBIN env vars."));
-      return safeReply(
-        msg,
-        emb(C.ok, `**${mentioned.username}** removed from whitelist.`)
-      );
+      if (!ok) return safeReply(msg, emb(C.err, "failed to save. check CF env vars."));
+      return safeReply(msg, emb(C.ok, `**${mentioned.username}** removed from whitelist.`));
     }
     if (sub === "list") {
-      if (!d.whitelist.length)
-        return safeReply(msg, emb(C.info, "no users whitelisted."));
-      return safeReply(
-        msg,
-        emb(
-          C.info,
-          d.whitelist.map((id) => `<@${id}>`).join("\n"),
-          "Whitelisted Users"
-        )
-      );
+      if (!d.whitelist.length) return safeReply(msg, emb(C.info, "no users whitelisted."));
+      return safeReply(msg, emb(C.info, d.whitelist.map((id) => `<@${id}>`).join("\n"), "Whitelisted Users"));
     }
-    return safeReply(
-      msg,
-      emb(C.warn, `usage: \`${prefix}whitelist add/remove/list\``)
-    );
+    return safeReply(msg, emb(C.warn, `usage: \`${prefix}whitelist add/remove/list\``));
   },
 
   async setup(msg, args, prefix) {
-    if (!await hasStaff(msg.member))
-      return safeReply(msg, emb(C.err, "staff only."));
+    if (!await hasStaff(msg.member)) return safeReply(msg, emb(C.err, "staff only."));
     const sub = args[0];
     const d = await loadData(true);
     if (sub === "universe") {
-      if (!args[1])
-        return safeReply(
-          msg,
-          emb(C.warn, `usage: \`${prefix}setup universe <id>\``)
-        );
-      if (!/^\d+$/.test(args[1]))
-        return safeReply(msg, emb(C.err, "universe ID must be numeric."));
+      if (!args[1]) return safeReply(msg, emb(C.warn, `usage: \`${prefix}setup universe <id>\``));
+      if (!/^\d+$/.test(args[1])) return safeReply(msg, emb(C.err, "universe ID must be numeric."));
       d.universeId = args[1];
       const ok = await saveData(d);
-      if (!ok) return safeReply(msg, emb(C.err, "failed to save. check JSONBIN env vars."));
-      return safeReply(
-        msg,
-        emb(C.ok, `universe ID set to \`${d.universeId}\``)
-      );
+      if (!ok) return safeReply(msg, emb(C.err, "failed to save. check CF env vars."));
+      return safeReply(msg, emb(C.ok, `universe ID set to \`${d.universeId}\``));
     }
     if (sub === "staffrole") {
       const roleName = args.slice(1).join(" ");
-      if (!roleName)
-        return safeReply(
-          msg,
-          emb(C.warn, `usage: \`${prefix}setup staffrole <role name>\``)
-        );
-      if (roleName.length > 100)
-        return safeReply(msg, emb(C.err, "role name too long (max 100)."));
+      if (!roleName) return safeReply(msg, emb(C.warn, `usage: \`${prefix}setup staffrole <role name>\``));
+      if (roleName.length > 100) return safeReply(msg, emb(C.err, "role name too long (max 100)."));
       d.staffRole = roleName;
       const ok = await saveData(d);
-      if (!ok) return safeReply(msg, emb(C.err, "failed to save. check JSONBIN env vars."));
-      return safeReply(
-        msg,
-        emb(C.ok, `staff role set to **${d.staffRole}**`)
-      );
+      if (!ok) return safeReply(msg, emb(C.err, "failed to save. check CF env vars."));
+      return safeReply(msg, emb(C.ok, `staff role set to **${d.staffRole}**`));
     }
     if (sub === "show") {
-      return safeReply(
-        msg,
-        emb(
-          C.info,
-          [
-            `**Universe ID:** \`${d.universeId || "not set"}\``,
-            `**Staff Role:** ${d.staffRole || "Staff Team"}`,
-            `**Main Datastore:** \`${d.mainDatastore || "MainData_v2"}\``,
-            `**Prefix:** \`${prefix}\``,
-            `**Whitelisted Users:** ${d.whitelist.length}`
-          ].join("\n"),
-          "Bot Settings"
-        )
-      );
+      return safeReply(msg, emb(C.info, [
+        `**Universe ID:** \`${d.universeId || "not set"}\``,
+        `**Staff Role:** ${d.staffRole || "Staff Team"}`,
+        `**Main Datastore:** \`${d.mainDatastore || "MainData_v2"}\``,
+        `**Prefix:** \`${prefix}\``,
+        `**Whitelisted Users:** ${d.whitelist.length}`
+      ].join("\n"), "Bot Settings"));
     }
-    return safeReply(
-      msg,
-      emb(C.warn, `usage: \`${prefix}setup universe/staffrole/show\``)
-    );
+    return safeReply(msg, emb(C.warn, `usage: \`${prefix}setup universe/staffrole/show\``));
   },
 
   async rban(msg, args, prefix) {
-    if (!await hasStaff(msg.member))
-      return safeReply(msg, emb(C.err, "staff only."));
+    if (!await hasStaff(msg.member)) return safeReply(msg, emb(C.err, "staff only."));
     const input = args[0];
-    if (!input)
-      return safeReply(
-        msg,
-        emb(C.warn, `usage: \`${prefix}rban <username or userid> [reason]\``)
-      );
+    if (!input) return safeReply(msg, emb(C.warn, `usage: \`${prefix}rban <username or userid> [reason]\``));
     const reason = args.slice(1).join(" ").slice(0, 500) || "No reason provided";
     const d = await loadData();
     const gameId = d.universeId;
-    if (!gameId)
-      return safeReply(msg, emb(C.err, "universe ID not set."));
+    if (!gameId) return safeReply(msg, emb(C.err, "universe ID not set."));
     const status = await safeReply(msg, emb(C.info, "looking up user..."));
     if (!status) return;
     const user = await resolveRobloxId(input);
-    if (!user)
-      return safeEdit(
-        status,
-        emb(C.err, `no Roblox user found for **${input}**.`)
-      );
+    if (!user) return safeEdit(status, emb(C.err, `no Roblox user found for **${input}**.`));
     const token = mkToken();
     setPending(token, {
       type: "ban",
@@ -1229,40 +921,26 @@ const prefixHandlers = {
       initiator: msg.author.id
     });
     return safeEdit(status, {
-      ...emb(
-        C.warn,
-        [
-          `**Roblox User:** ${user.displayName} (\`${user.name}\`)`,
-          `**User ID:** \`${user.id}\``,
-          `**Reason:** ${reason}`
-        ].join("\n"),
-        "Confirm Ban"
-      ),
+      ...emb(C.warn, [
+        `**Roblox User:** ${user.displayName} (\`${user.name}\`)`,
+        `**User ID:** \`${user.id}\``,
+        `**Reason:** ${reason}`
+      ].join("\n"), "Confirm Ban"),
       components: [confirmRow(token)]
     });
   },
 
   async runban(msg, args, prefix) {
-    if (!await hasStaff(msg.member))
-      return safeReply(msg, emb(C.err, "staff only."));
+    if (!await hasStaff(msg.member)) return safeReply(msg, emb(C.err, "staff only."));
     const input = args[0];
-    if (!input)
-      return safeReply(
-        msg,
-        emb(C.warn, `usage: \`${prefix}runban <username or userid>\``)
-      );
+    if (!input) return safeReply(msg, emb(C.warn, `usage: \`${prefix}runban <username or userid>\``));
     const d = await loadData();
     const gameId = d.universeId;
-    if (!gameId)
-      return safeReply(msg, emb(C.err, "universe ID not set."));
+    if (!gameId) return safeReply(msg, emb(C.err, "universe ID not set."));
     const status = await safeReply(msg, emb(C.info, "looking up user..."));
     if (!status) return;
     const user = await resolveRobloxId(input);
-    if (!user)
-      return safeEdit(
-        status,
-        emb(C.err, `no Roblox user found for **${input}**.`)
-      );
+    if (!user) return safeEdit(status, emb(C.err, `no Roblox user found for **${input}**.`));
     const token = mkToken();
     setPending(token, {
       type: "unban",
@@ -1274,14 +952,10 @@ const prefixHandlers = {
       initiator: msg.author.id
     });
     return safeEdit(status, {
-      ...emb(
-        C.warn,
-        [
-          `**Roblox User:** ${user.displayName} (\`${user.name}\`)`,
-          `**User ID:** \`${user.id}\``
-        ].join("\n"),
-        "Confirm Unban"
-      ),
+      ...emb(C.warn, [
+        `**Roblox User:** ${user.displayName} (\`${user.name}\`)`,
+        `**User ID:** \`${user.id}\``
+      ].join("\n"), "Confirm Unban"),
       components: [confirmRow(token)]
     });
   },
@@ -1292,168 +966,69 @@ const prefixHandlers = {
     const sub = args[0];
     const d = await loadData();
     const uid = d.universeId;
-    if (!uid)
-      return safeReply(
-        msg,
-        emb(C.err, "universe ID not set. run `setup universe` first.")
-      );
+    if (!uid) return safeReply(msg, emb(C.err, "universe ID not set."));
     const store = args[1];
     const key = args[2];
     if (sub === "list") {
       try {
         const data = await dsListStores(uid);
-        const stores = data?.datastores
-          ?.map((s) => `\`${s.name}\``)
-          .join("\n");
-        return safeReply(
-          msg,
-          emb(
-            stores ? C.info : C.warn,
-            stores || "no datastores found.",
-            stores ? "Datastores" : null
-          )
-        );
+        const stores = data?.datastores?.map((s) => `\`${s.name}\``).join("\n");
+        return safeReply(msg, emb(stores ? C.info : C.warn, stores || "no datastores found.", stores ? "Datastores" : null));
       } catch (e) {
         return safeReply(msg, emb(C.err, `error: ${e.message}`));
       }
     }
     if (sub === "entries") {
-      if (!store)
-        return safeReply(
-          msg,
-          emb(C.warn, `usage: \`${prefix}ds entries <store>\``)
-        );
+      if (!store) return safeReply(msg, emb(C.warn, `usage: \`${prefix}ds entries <store>\``));
       try {
         const data = await dsListEntries(uid, store);
         const keys = data?.keys?.map((k) => `\`${k.key}\``).join("\n");
-        return safeReply(
-          msg,
-          emb(
-            keys ? C.info : C.warn,
-            keys || "no entries found.",
-            keys ? `${store} Entries` : null
-          )
-        );
+        return safeReply(msg, emb(keys ? C.info : C.warn, keys || "no entries found.", keys ? `${store} Entries` : null));
       } catch (e) {
         return safeReply(msg, emb(C.err, `error: ${e.message}`));
       }
     }
     if (sub === "get") {
-      if (!store || !key)
-        return safeReply(
-          msg,
-          emb(C.warn, `usage: \`${prefix}ds get <store> <key>\``)
-        );
+      if (!store || !key) return safeReply(msg, emb(C.warn, `usage: \`${prefix}ds get <store> <key>\``));
       const { status, body } = await dsGetEntry(uid, store, key);
-      if (status !== 200)
-        return safeReply(msg, emb(C.err, `failed (${status})`));
+      if (status !== 200) return safeReply(msg, emb(C.err, `failed (${status})`));
       const preview = body.length > 1800 ? body.slice(0, 1800) + "..." : body;
-      return safeReply(
-        msg,
-        emb(C.info, `\`\`\`json\n${preview}\n\`\`\``, `${store} / ${key}`)
-      );
+      return safeReply(msg, emb(C.info, `\`\`\`json\n${preview}\n\`\`\``, `${store} / ${key}`));
     }
     if (sub === "set") {
-      if (!store || !key || !args[3])
-        return safeReply(
-          msg,
-          emb(C.warn, `usage: \`${prefix}ds set <store> <key> <value>\``)
-        );
+      if (!store || !key || !args[3]) return safeReply(msg, emb(C.warn, `usage: \`${prefix}ds set <store> <key> <value>\``));
       let value = args.slice(3).join(" ");
-      try {
-        JSON.parse(value);
-      } catch {
-        value = JSON.stringify(value);
-      }
+      try { JSON.parse(value); } catch { value = JSON.stringify(value); }
       const { status, ok } = await dsSetEntry(uid, store, key, value);
-      return safeReply(
-        msg,
-        emb(
-          ok ? C.ok : C.err,
-          ok ? `**${store} / ${key}** updated.` : `failed (${status})`
-        )
-      );
+      return safeReply(msg, emb(ok ? C.ok : C.err, ok ? `**${store} / ${key}** updated.` : `failed (${status})`));
     }
     if (sub === "delete") {
-      if (!store || !key)
-        return safeReply(
-          msg,
-          emb(C.warn, `usage: \`${prefix}ds delete <store> <key>\``)
-        );
+      if (!store || !key) return safeReply(msg, emb(C.warn, `usage: \`${prefix}ds delete <store> <key>\``));
       const token = mkToken();
-      setPending(token, {
-        type: "dsdel",
-        uid,
-        store,
-        key,
-        initiator: msg.author.id
-      });
+      setPending(token, { type: "dsdel", uid, store, key, initiator: msg.author.id });
       return safeReply(msg, {
         ...emb(C.warn, `delete **${store} / ${key}**?`, "Confirm Delete"),
         components: [confirmRow(token)]
       });
     }
     if (sub === "increment") {
-      if (!store || !key || !args[3])
-        return safeReply(
-          msg,
-          emb(
-            C.warn,
-            `usage: \`${prefix}ds increment <store> <key> <amount>\``
-          )
-        );
+      if (!store || !key || !args[3]) return safeReply(msg, emb(C.warn, `usage: \`${prefix}ds increment <store> <key> <amount>\``));
       const amount = parseFloat(args[3]);
-      if (isNaN(amount))
-        return safeReply(msg, emb(C.err, "amount must be a number."));
-      const { status, body, ok } = await dsIncrementEntry(
-        uid,
-        store,
-        key,
-        amount
-      );
-      return safeReply(
-        msg,
-        emb(
-          ok ? C.ok : C.err,
-          ok
-            ? `**${store} / ${key}** new value: \`${body}\``
-            : `failed (${status})`
-        )
-      );
+      if (isNaN(amount)) return safeReply(msg, emb(C.err, "amount must be a number."));
+      const { status, body, ok } = await dsIncrementEntry(uid, store, key, amount);
+      return safeReply(msg, emb(ok ? C.ok : C.err, ok ? `**${store} / ${key}** new value: \`${body}\`` : `failed (${status})`));
     }
     if (sub === "versions") {
-      if (!store || !key)
-        return safeReply(
-          msg,
-          emb(C.warn, `usage: \`${prefix}ds versions <store> <key>\``)
-        );
+      if (!store || !key) return safeReply(msg, emb(C.warn, `usage: \`${prefix}ds versions <store> <key>\``));
       try {
         const data = await dsListVersions(uid, store, key);
-        const versions = data?.versions
-          ?.map(
-            (v) =>
-              `\`${v.version}\` — ${new Date(v.createdTime).toLocaleString()}`
-          )
-          .join("\n");
-        return safeReply(
-          msg,
-          emb(
-            versions ? C.info : C.warn,
-            versions || "no versions found.",
-            versions ? `${store} / ${key} Versions` : null
-          )
-        );
+        const versions = data?.versions?.map((v) => `\`${v.version}\` — ${new Date(v.createdTime).toLocaleString()}`).join("\n");
+        return safeReply(msg, emb(versions ? C.info : C.warn, versions || "no versions found.", versions ? `${store} / ${key} Versions` : null));
       } catch (e) {
         return safeReply(msg, emb(C.err, `error: ${e.message}`));
       }
     }
-    return safeReply(
-      msg,
-      emb(
-        C.warn,
-        `usage: \`${prefix}ds list/entries/get/set/delete/increment/versions\``
-      )
-    );
+    return safeReply(msg, emb(C.warn, `usage: \`${prefix}ds list/entries/get/set/delete/increment/versions\``));
   }
 };
 
@@ -1475,27 +1050,15 @@ client.on("messageCreate", async (msg) => {
 });
 
 async function handleSlashUpload(interaction) {
-  if (
-    !await isWhitelisted(interaction.user.id) &&
-    !await hasStaff(interaction.member)
-  )
-    return safeInteractionReply(
-      interaction,
-      emb(C.err, "you're not whitelisted."),
-      true
-    );
+  if (!await isWhitelisted(interaction.user.id) && !await hasStaff(interaction.member))
+    return safeInteractionReply(interaction, emb(C.err, "you're not whitelisted."), true);
   const files = [];
   for (let i = 1; i <= FILE_COUNT; i++) {
     const f = interaction.options.getAttachment(`file${i}`);
     if (f) files.push(f);
   }
   const mp3s = files.filter((f) => f.name?.toLowerCase().endsWith(".mp3"));
-  if (!mp3s.length)
-    return safeInteractionReply(
-      interaction,
-      emb(C.err, "attach at least one mp3 file."),
-      true
-    );
+  if (!mp3s.length) return safeInteractionReply(interaction, emb(C.err, "attach at least one mp3 file."), true);
   await interaction.deferReply();
   const lines = [];
   for (const file of mp3s) {
@@ -1511,212 +1074,109 @@ async function handleSlashUpload(interaction) {
 
 async function handleSlashWhitelist(interaction) {
   if (!isOwner(interaction.user.id))
-    return safeInteractionReply(
-      interaction,
-      emb(C.err, "owner only."),
-      true
-    );
+    return safeInteractionReply(interaction, emb(C.err, "owner only."), true);
   const sub = interaction.options.getSubcommand();
   const d = await loadData(true);
   if (sub === "add") {
     const user = interaction.options.getUser("user");
     if (d.whitelist.includes(user.id))
-      return safeInteractionReply(
-        interaction,
-        emb(C.warn, `${user.username} is already whitelisted.`),
-        true
-      );
+      return safeInteractionReply(interaction, emb(C.warn, `${user.username} is already whitelisted.`), true);
     d.whitelist.push(user.id);
     const ok = await saveData(d);
-    if (!ok)
-      return safeInteractionReply(interaction, emb(C.err, "failed to save. check JSONBIN env vars."), true);
-    return safeInteractionReply(
-      interaction,
-      emb(C.ok, `**${user.username}** added to whitelist.`)
-    );
+    if (!ok) return safeInteractionReply(interaction, emb(C.err, "failed to save. check CF env vars."), true);
+    return safeInteractionReply(interaction, emb(C.ok, `**${user.username}** added to whitelist.`));
   }
   if (sub === "remove") {
     const user = interaction.options.getUser("user");
     if (!d.whitelist.includes(user.id))
-      return safeInteractionReply(
-        interaction,
-        emb(C.warn, `${user.username} isn't whitelisted.`),
-        true
-      );
+      return safeInteractionReply(interaction, emb(C.warn, `${user.username} isn't whitelisted.`), true);
     d.whitelist = d.whitelist.filter((id) => id !== user.id);
     const ok = await saveData(d);
-    if (!ok)
-      return safeInteractionReply(interaction, emb(C.err, "failed to save. check JSONBIN env vars."), true);
-    return safeInteractionReply(
-      interaction,
-      emb(C.ok, `**${user.username}** removed from whitelist.`)
-    );
+    if (!ok) return safeInteractionReply(interaction, emb(C.err, "failed to save. check CF env vars."), true);
+    return safeInteractionReply(interaction, emb(C.ok, `**${user.username}** removed from whitelist.`));
   }
   if (sub === "list") {
-    if (!d.whitelist.length)
-      return safeInteractionReply(
-        interaction,
-        emb(C.info, "no users whitelisted.")
-      );
-    return safeInteractionReply(
-      interaction,
-      emb(
-        C.info,
-        d.whitelist.map((id) => `<@${id}>`).join("\n"),
-        "Whitelisted Users"
-      )
-    );
+    if (!d.whitelist.length) return safeInteractionReply(interaction, emb(C.info, "no users whitelisted."));
+    return safeInteractionReply(interaction, emb(C.info, d.whitelist.map((id) => `<@${id}>`).join("\n"), "Whitelisted Users"));
   }
 }
 
 async function handleSlashSetup(interaction) {
   if (!await hasStaff(interaction.member))
-    return safeInteractionReply(
-      interaction,
-      emb(C.err, "staff only."),
-      true
-    );
+    return safeInteractionReply(interaction, emb(C.err, "staff only."), true);
   const sub = interaction.options.getSubcommand();
   const d = await loadData(true);
   if (sub === "universe") {
     const id = interaction.options.getString("id");
-    if (!/^\d+$/.test(id))
-      return safeInteractionReply(
-        interaction,
-        emb(C.err, "universe ID must be numeric."),
-        true
-      );
+    if (!/^\d+$/.test(id)) return safeInteractionReply(interaction, emb(C.err, "universe ID must be numeric."), true);
     d.universeId = id;
     const ok = await saveData(d);
-    if (!ok)
-      return safeInteractionReply(interaction, emb(C.err, "failed to save. check JSONBIN env vars."), true);
-    return safeInteractionReply(
-      interaction,
-      emb(C.ok, `universe ID set to \`${id}\``)
-    );
+    if (!ok) return safeInteractionReply(interaction, emb(C.err, "failed to save. check CF env vars."), true);
+    return safeInteractionReply(interaction, emb(C.ok, `universe ID set to \`${id}\``));
   }
   if (sub === "staffrole") {
     const name = interaction.options.getString("name").slice(0, 100);
     d.staffRole = name;
     const ok = await saveData(d);
-    if (!ok)
-      return safeInteractionReply(interaction, emb(C.err, "failed to save. check JSONBIN env vars."), true);
-    return safeInteractionReply(
-      interaction,
-      emb(C.ok, `staff role set to **${name}**`)
-    );
+    if (!ok) return safeInteractionReply(interaction, emb(C.err, "failed to save. check CF env vars."), true);
+    return safeInteractionReply(interaction, emb(C.ok, `staff role set to **${name}**`));
   }
   if (sub === "prefix") {
     const np = interaction.options.getString("prefix").slice(0, 5);
     if (!d.prefixes) d.prefixes = {};
     d.prefixes[interaction.guildId] = np;
     const ok = await saveData(d);
-    if (!ok)
-      return safeInteractionReply(interaction, emb(C.err, "failed to save. check JSONBIN env vars."), true);
-    return safeInteractionReply(
-      interaction,
-      emb(C.ok, `prefix set to \`${np}\``)
-    );
+    if (!ok) return safeInteractionReply(interaction, emb(C.err, "failed to save. check CF env vars."), true);
+    return safeInteractionReply(interaction, emb(C.ok, `prefix set to \`${np}\``));
   }
   if (sub === "show") {
     const prefix = d.prefixes?.[interaction.guildId] || DEFAULT_PREFIX;
-    return safeInteractionReply(
-      interaction,
-      emb(
-        C.info,
-        [
-          `**Universe ID:** \`${d.universeId || "not set"}\``,
-          `**Staff Role:** ${d.staffRole || "Staff Team"}`,
-          `**Main Datastore:** \`${d.mainDatastore || "MainData_v2"}\``,
-          `**Prefix:** \`${prefix}\``,
-          `**Whitelisted Users:** ${d.whitelist.length}`
-        ].join("\n"),
-        "Bot Settings"
-      )
-    );
+    return safeInteractionReply(interaction, emb(C.info, [
+      `**Universe ID:** \`${d.universeId || "not set"}\``,
+      `**Staff Role:** ${d.staffRole || "Staff Team"}`,
+      `**Main Datastore:** \`${d.mainDatastore || "MainData_v2"}\``,
+      `**Prefix:** \`${prefix}\``,
+      `**Whitelisted Users:** ${d.whitelist.length}`
+    ].join("\n"), "Bot Settings"));
   }
 }
 
 async function handleSlashDs(interaction) {
-  if (
-    !await hasStaff(interaction.member) &&
-    !await isWhitelisted(interaction.user.id)
-  )
-    return safeInteractionReply(
-      interaction,
-      emb(C.err, "you're not whitelisted."),
-      true
-    );
+  if (!await hasStaff(interaction.member) && !await isWhitelisted(interaction.user.id))
+    return safeInteractionReply(interaction, emb(C.err, "you're not whitelisted."), true);
   const d = await loadData();
   const uid = d.universeId;
-  if (!uid)
-    return safeInteractionReply(
-      interaction,
-      emb(C.err, "universe ID not set."),
-      true
-    );
+  if (!uid) return safeInteractionReply(interaction, emb(C.err, "universe ID not set."), true);
   const sub = interaction.options.getSubcommand();
   await interaction.deferReply();
   try {
     if (sub === "list") {
       const data = await dsListStores(uid);
-      const stores = data?.datastores
-        ?.map((s) => `\`${s.name}\``)
-        .join("\n");
-      return interaction.editReply(
-        emb(
-          stores ? C.info : C.warn,
-          stores || "no datastores found.",
-          stores ? "Datastores" : null
-        )
-      );
+      const stores = data?.datastores?.map((s) => `\`${s.name}\``).join("\n");
+      return interaction.editReply(emb(stores ? C.info : C.warn, stores || "no datastores found.", stores ? "Datastores" : null));
     }
     const store = interaction.options.getString("store");
     const key = interaction.options.getString("key");
     if (sub === "entries") {
       const data = await dsListEntries(uid, store);
       const keys = data?.keys?.map((k) => `\`${k.key}\``).join("\n");
-      return interaction.editReply(
-        emb(
-          keys ? C.info : C.warn,
-          keys || "no entries found.",
-          keys ? `${store} Entries` : null
-        )
-      );
+      return interaction.editReply(emb(keys ? C.info : C.warn, keys || "no entries found.", keys ? `${store} Entries` : null));
     }
     if (sub === "get") {
       const { status, body } = await dsGetEntry(uid, store, key);
-      if (status !== 200)
-        return interaction.editReply(emb(C.err, `failed (${status})`));
+      if (status !== 200) return interaction.editReply(emb(C.err, `failed (${status})`));
       const preview = body.length > 1800 ? body.slice(0, 1800) + "..." : body;
-      return interaction.editReply(
-        emb(C.info, `\`\`\`json\n${preview}\n\`\`\``, `${store} / ${key}`)
-      );
+      return interaction.editReply(emb(C.info, `\`\`\`json\n${preview}\n\`\`\``, `${store} / ${key}`));
     }
     if (sub === "set") {
       let value = interaction.options.getString("value");
-      try {
-        JSON.parse(value);
-      } catch {
-        value = JSON.stringify(value);
-      }
+      try { JSON.parse(value); } catch { value = JSON.stringify(value); }
       const { status, ok } = await dsSetEntry(uid, store, key, value);
-      return interaction.editReply(
-        emb(
-          ok ? C.ok : C.err,
-          ok ? `**${store} / ${key}** updated.` : `failed (${status})`
-        )
-      );
+      return interaction.editReply(emb(ok ? C.ok : C.err, ok ? `**${store} / ${key}** updated.` : `failed (${status})`));
     }
     if (sub === "delete") {
       const token = mkToken();
-      setPending(token, {
-        type: "dsdel",
-        uid,
-        store,
-        key,
-        initiator: interaction.user.id
-      });
+      setPending(token, { type: "dsdel", uid, store, key, initiator: interaction.user.id });
       return interaction.editReply({
         ...emb(C.warn, `delete **${store} / ${key}**?`, "Confirm Delete"),
         components: [confirmRow(token)]
@@ -1724,36 +1184,13 @@ async function handleSlashDs(interaction) {
     }
     if (sub === "increment") {
       const amount = interaction.options.getNumber("amount");
-      const { status, body, ok } = await dsIncrementEntry(
-        uid,
-        store,
-        key,
-        amount
-      );
-      return interaction.editReply(
-        emb(
-          ok ? C.ok : C.err,
-          ok
-            ? `**${store} / ${key}** new value: \`${body}\``
-            : `failed (${status})`
-        )
-      );
+      const { status, body, ok } = await dsIncrementEntry(uid, store, key, amount);
+      return interaction.editReply(emb(ok ? C.ok : C.err, ok ? `**${store} / ${key}** new value: \`${body}\`` : `failed (${status})`));
     }
     if (sub === "versions") {
       const data = await dsListVersions(uid, store, key);
-      const versions = data?.versions
-        ?.map(
-          (v) =>
-            `\`${v.version}\` — ${new Date(v.createdTime).toLocaleString()}`
-        )
-        .join("\n");
-      return interaction.editReply(
-        emb(
-          versions ? C.info : C.warn,
-          versions || "no versions found.",
-          versions ? `${store} / ${key} Versions` : null
-        )
-      );
+      const versions = data?.versions?.map((v) => `\`${v.version}\` — ${new Date(v.createdTime).toLocaleString()}`).join("\n");
+      return interaction.editReply(emb(versions ? C.info : C.warn, versions || "no versions found.", versions ? `${store} / ${key} Versions` : null));
     }
   } catch (e) {
     console.error("ds slash error:", e);
@@ -1763,29 +1200,15 @@ async function handleSlashDs(interaction) {
 
 async function handleSlashBan(interaction) {
   if (!await hasStaff(interaction.member))
-    return safeInteractionReply(
-      interaction,
-      emb(C.err, "staff only."),
-      true
-    );
+    return safeInteractionReply(interaction, emb(C.err, "staff only."), true);
   const input = interaction.options.getString("username");
-  const reason =
-    interaction.options.getString("reason")?.slice(0, 500) ||
-    "No reason provided";
+  const reason = interaction.options.getString("reason")?.slice(0, 500) || "No reason provided";
   const d = await loadData();
   const gameId = d.universeId;
-  if (!gameId)
-    return safeInteractionReply(
-      interaction,
-      emb(C.err, "universe ID not set."),
-      true
-    );
+  if (!gameId) return safeInteractionReply(interaction, emb(C.err, "universe ID not set."), true);
   await interaction.deferReply();
   const user = await resolveRobloxId(input);
-  if (!user)
-    return interaction.editReply(
-      emb(C.err, `no Roblox user found for **${input}**.`)
-    );
+  if (!user) return interaction.editReply(emb(C.err, `no Roblox user found for **${input}**.`));
   const token = mkToken();
   setPending(token, {
     type: "ban",
@@ -1798,41 +1221,25 @@ async function handleSlashBan(interaction) {
     initiator: interaction.user.id
   });
   return interaction.editReply({
-    ...emb(
-      C.warn,
-      [
-        `**Roblox User:** ${user.displayName} (\`${user.name}\`)`,
-        `**User ID:** \`${user.id}\``,
-        `**Reason:** ${reason}`
-      ].join("\n"),
-      "Confirm Ban"
-    ),
+    ...emb(C.warn, [
+      `**Roblox User:** ${user.displayName} (\`${user.name}\`)`,
+      `**User ID:** \`${user.id}\``,
+      `**Reason:** ${reason}`
+    ].join("\n"), "Confirm Ban"),
     components: [confirmRow(token)]
   });
 }
 
 async function handleSlashUnban(interaction) {
   if (!await hasStaff(interaction.member))
-    return safeInteractionReply(
-      interaction,
-      emb(C.err, "staff only."),
-      true
-    );
+    return safeInteractionReply(interaction, emb(C.err, "staff only."), true);
   const input = interaction.options.getString("username");
   const d = await loadData();
   const gameId = d.universeId;
-  if (!gameId)
-    return safeInteractionReply(
-      interaction,
-      emb(C.err, "universe ID not set."),
-      true
-    );
+  if (!gameId) return safeInteractionReply(interaction, emb(C.err, "universe ID not set."), true);
   await interaction.deferReply();
   const user = await resolveRobloxId(input);
-  if (!user)
-    return interaction.editReply(
-      emb(C.err, `no Roblox user found for **${input}**.`)
-    );
+  if (!user) return interaction.editReply(emb(C.err, `no Roblox user found for **${input}**.`));
   const token = mkToken();
   setPending(token, {
     type: "unban",
@@ -1844,14 +1251,10 @@ async function handleSlashUnban(interaction) {
     initiator: interaction.user.id
   });
   return interaction.editReply({
-    ...emb(
-      C.warn,
-      [
-        `**Roblox User:** ${user.displayName} (\`${user.name}\`)`,
-        `**User ID:** \`${user.id}\``
-      ].join("\n"),
-      "Confirm Unban"
-    ),
+    ...emb(C.warn, [
+      `**Roblox User:** ${user.displayName} (\`${user.name}\`)`,
+      `**User ID:** \`${user.id}\``
+    ].join("\n"), "Confirm Unban"),
     components: [confirmRow(token)]
   });
 }
@@ -1879,32 +1282,16 @@ client.on("interactionCreate", async (interaction) => {
       const field = interaction.customId.slice(0, cidx);
       const token = interaction.customId.slice(cidx + 8);
       const pend = getPending(token);
-      if (!pend)
-        return safeInteractionReply(
-          interaction,
-          emb(C.err, "this action has expired."),
-          true
-        );
+      if (!pend) return safeInteractionReply(interaction, emb(C.err, "this action has expired."), true);
       if (pend.initiator && pend.initiator !== interaction.user.id)
-        return safeInteractionReply(
-          interaction,
-          emb(C.err, "you didn't initiate this action."),
-          true
-        );
+        return safeInteractionReply(interaction, emb(C.err, "you didn't initiate this action."), true);
       const slot = interaction.values[0];
       const saves = pend.pdata?.Data?.[field];
-      if (!saves || !(slot in saves))
-        return safeInteractionReply(
-          interaction,
-          emb(C.err, "invalid slot."),
-          true
-        );
+      if (!saves || !(slot in saves)) return safeInteractionReply(interaction, emb(C.err, "invalid slot."), true);
       const currentVal = String(saves[slot] ?? "");
       pend.slot = slot;
       setPending(token, pend);
-      const modal = new ModalBuilder()
-        .setCustomId(`save_modal_${token}`)
-        .setTitle(`Edit ${slot}`);
+      const modal = new ModalBuilder().setCustomId(`save_modal_${token}`).setTitle(`Edit ${slot}`);
       modal.addComponents(
         new ActionRowBuilder().addComponents(
           new TextInputBuilder()
@@ -1923,55 +1310,25 @@ client.on("interactionCreate", async (interaction) => {
       if (!interaction.customId.startsWith("save_modal_")) return;
       const token = interaction.customId.slice(11);
       const pend = consumePending(token);
-      if (!pend)
-        return safeInteractionReply(
-          interaction,
-          emb(C.err, "this action has expired."),
-          true
-        );
+      if (!pend) return safeInteractionReply(interaction, emb(C.err, "this action has expired."), true);
       if (pend.initiator && pend.initiator !== interaction.user.id)
-        return safeInteractionReply(
-          interaction,
-          emb(C.err, "you didn't initiate this action."),
-          true
-        );
+        return safeInteractionReply(interaction, emb(C.err, "you didn't initiate this action."), true);
       const newVal = interaction.fields.getTextInputValue("new_value");
-      if (!newVal || !newVal.trim())
-        return safeInteractionReply(
-          interaction,
-          emb(C.err, "value cannot be empty."),
-          true
-        );
-      const { slot, field, uid, dsName, userId, username, displayName, pdata } =
-        pend;
+      if (!newVal || !newVal.trim()) return safeInteractionReply(interaction, emb(C.err, "value cannot be empty."), true);
+      const { slot, field, uid, dsName, userId, username, displayName, pdata } = pend;
       if (!slot || !field || !uid || !dsName || !userId || !pdata)
-        return safeInteractionReply(
-          interaction,
-          emb(C.err, "incomplete pending data."),
-          true
-        );
+        return safeInteractionReply(interaction, emb(C.err, "incomplete pending data."), true);
       const newPdata = structuredClone(pdata);
       newPdata.Data[field][slot] = newVal;
       const confirmToken = mkToken();
       const label = field === "troll_saves" ? "Troll Save" : "Item Save";
-      setPending(confirmToken, {
-        type: "generic_confirm",
-        uid,
-        dsName,
-        userId,
-        newPdata,
-        initiator: pend.initiator
-      });
+      setPending(confirmToken, { type: "generic_confirm", uid, dsName, userId, newPdata, initiator: pend.initiator });
       return safeInteractionReply(interaction, {
-        ...emb(
-          C.warn,
-          [
-            `**Player:** ${displayName} (\`${username}\`)`,
-            `**Slot:** \`${slot}\``,
-            `**New Value:** ${newVal}`
-          ].join("\n"),
-          `Confirm Edit ${label}`
-        ),
+        ...emb(C.warn, [
+          `**Player:** ${displayName} (\`${username}\`)`,
+          `**Slot:** \`${slot}\``,
+          `**New Value:** ${newVal}`
+        ].join("\n"), `Confirm Edit ${label}`),
         components: [confirmRow(confirmToken)]
       });
     }
@@ -1980,174 +1337,88 @@ client.on("interactionCreate", async (interaction) => {
       const parts = interaction.customId.split("_");
       const btnAction = parts[0];
       const btnToken = parts[parts.length - 1];
-
       if (btnAction !== "confirm" && btnAction !== "cancel") return;
-
       const peeked = getPending(btnToken);
-      if (!peeked)
-        return safeInteractionReply(
-          interaction,
-          emb(C.err, "this action has expired."),
-          true
-        );
+      if (!peeked) return safeInteractionReply(interaction, emb(C.err, "this action has expired."), true);
       if (peeked.initiator && peeked.initiator !== interaction.user.id)
-        return safeInteractionReply(
-          interaction,
-          emb(C.err, "you didn't initiate this action."),
-          true
-        );
-
+        return safeInteractionReply(interaction, emb(C.err, "you didn't initiate this action."), true);
       const data = consumePending(btnToken);
-      if (!data)
-        return safeInteractionReply(
-          interaction,
-          emb(C.err, "this action has expired."),
-          true
-        );
-
+      if (!data) return safeInteractionReply(interaction, emb(C.err, "this action has expired."), true);
       if (btnAction === "cancel")
-        return safeInteractionUpdate(interaction, {
-          ...emb(C.info, "action cancelled."),
-          components: []
-        });
-
+        return safeInteractionUpdate(interaction, { ...emb(C.info, "action cancelled."), components: [] });
       if (data.type === "generic_confirm") {
         if (!data.uid || !data.userId || !data.newPdata || !data.dsName)
-          return safeInteractionUpdate(interaction, {
-            ...emb(C.err, "incomplete data."),
-            components: []
-          });
-        const { ok, status } = await setPlayerData(
-          data.uid,
-          data.userId,
-          data.newPdata,
-          data.dsName
-        );
+          return safeInteractionUpdate(interaction, { ...emb(C.err, "incomplete data."), components: [] });
+        const { ok, status } = await setPlayerData(data.uid, data.userId, data.newPdata, data.dsName);
         return safeInteractionUpdate(interaction, {
-          ...emb(
-            ok ? C.ok : C.err,
-            ok ? "data updated successfully." : `failed (${status})`
-          ),
+          ...emb(ok ? C.ok : C.err, ok ? "data updated successfully." : `failed (${status})`),
           components: []
         });
       }
-
       if (data.type === "dsdel") {
         if (!data.uid || !data.store || !data.key)
-          return safeInteractionUpdate(interaction, {
-            ...emb(C.err, "incomplete data."),
-            components: []
-          });
-        const { status, ok } = await dsDeleteEntry(
-          data.uid,
-          data.store,
-          data.key
-        );
+          return safeInteractionUpdate(interaction, { ...emb(C.err, "incomplete data."), components: [] });
+        const { status, ok } = await dsDeleteEntry(data.uid, data.store, data.key);
         return safeInteractionUpdate(interaction, {
-          ...emb(
-            ok ? C.ok : C.err,
-            ok
-              ? `**${data.store} / ${data.key}** deleted.`
-              : `failed (${status})`
-          ),
+          ...emb(ok ? C.ok : C.err, ok ? `**${data.store} / ${data.key}** deleted.` : `failed (${status})`),
           components: []
         });
       }
-
       if (data.type === "ban") {
         if (!data.gameId || !data.userId)
-          return safeInteractionUpdate(interaction, {
-            ...emb(C.err, "incomplete data."),
-            components: []
-          });
+          return safeInteractionUpdate(interaction, { ...emb(C.err, "incomplete data."), components: [] });
         try {
           const res = await fetch(
             `https://apis.roblox.com/cloud/v2/universes/${data.gameId}/user-restrictions/${data.userId}`,
             {
               method: "PATCH",
-              headers: {
-                "x-api-key": process.env.ROBLOX_API_KEY,
-                "Content-Type": "application/json"
-              },
+              headers: { "x-api-key": process.env.ROBLOX_API_KEY, "Content-Type": "application/json" },
               body: JSON.stringify({
-                gameJoinRestriction: {
-                  active: true,
-                  privateReason: data.reason,
-                  displayReason: data.reason
-                }
+                gameJoinRestriction: { active: true, privateReason: data.reason, displayReason: data.reason }
               })
             }
           );
           const result = await res.json();
           const ok = res.ok || result?.gameJoinRestriction;
           return safeInteractionUpdate(interaction, {
-            ...emb(
-              ok ? C.ok : C.err,
-              ok
-                ? `**${data.displayName}** (\`${data.username}\`) banned.\n**Reason:** ${data.reason}`
-                : `failed: ${JSON.stringify(result).slice(0, 1000)}`
-            ),
+            ...emb(ok ? C.ok : C.err, ok
+              ? `**${data.displayName}** (\`${data.username}\`) banned.\n**Reason:** ${data.reason}`
+              : `failed: ${JSON.stringify(result).slice(0, 1000)}`),
             components: []
           });
         } catch (e) {
-          return safeInteractionUpdate(interaction, {
-            ...emb(C.err, `ban request failed: ${e.message}`),
-            components: []
-          });
+          return safeInteractionUpdate(interaction, { ...emb(C.err, `ban request failed: ${e.message}`), components: [] });
         }
       }
-
       if (data.type === "unban") {
         if (!data.gameId || !data.userId)
-          return safeInteractionUpdate(interaction, {
-            ...emb(C.err, "incomplete data."),
-            components: []
-          });
+          return safeInteractionUpdate(interaction, { ...emb(C.err, "incomplete data."), components: [] });
         try {
           const res = await fetch(
             `https://apis.roblox.com/cloud/v2/universes/${data.gameId}/user-restrictions/${data.userId}`,
             {
               method: "PATCH",
-              headers: {
-                "x-api-key": process.env.ROBLOX_API_KEY,
-                "Content-Type": "application/json"
-              },
-              body: JSON.stringify({
-                gameJoinRestriction: { active: false }
-              })
+              headers: { "x-api-key": process.env.ROBLOX_API_KEY, "Content-Type": "application/json" },
+              body: JSON.stringify({ gameJoinRestriction: { active: false } })
             }
           );
           const result = await res.json();
           const ok = res.ok || result?.gameJoinRestriction;
           return safeInteractionUpdate(interaction, {
-            ...emb(
-              ok ? C.ok : C.err,
-              ok
-                ? `**${data.displayName}** (\`${data.username}\`) unbanned.`
-                : `failed: ${JSON.stringify(result).slice(0, 1000)}`
-            ),
+            ...emb(ok ? C.ok : C.err, ok
+              ? `**${data.displayName}** (\`${data.username}\`) unbanned.`
+              : `failed: ${JSON.stringify(result).slice(0, 1000)}`),
             components: []
           });
         } catch (e) {
-          return safeInteractionUpdate(interaction, {
-            ...emb(C.err, `unban request failed: ${e.message}`),
-            components: []
-          });
+          return safeInteractionUpdate(interaction, { ...emb(C.err, `unban request failed: ${e.message}`), components: [] });
         }
       }
-
-      return safeInteractionUpdate(interaction, {
-        ...emb(C.err, "unknown action type."),
-        components: []
-      });
+      return safeInteractionUpdate(interaction, { ...emb(C.err, "unknown action type."), components: [] });
     }
   } catch (e) {
     console.error("interaction handler error:", e);
-    safeInteractionReply(
-      interaction,
-      emb(C.err, "an unexpected error occurred."),
-      true
-    ).catch(() => {});
+    safeInteractionReply(interaction, emb(C.err, "an unexpected error occurred."), true).catch(() => {});
   }
 });
 
